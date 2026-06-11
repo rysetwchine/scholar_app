@@ -30,8 +30,11 @@ subprojects {
         }
     }
 }
+
 subprojects {
-    project.evaluationDependsOn(":app")
+    if (project.path != ":app") {
+        evaluationDependsOn(":app")
+    }
 }
 
 tasks.register<Delete>("clean") {
