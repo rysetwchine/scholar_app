@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest.dart' as tz;
 import 'package:flutter_tts/flutter_tts.dart';
@@ -79,12 +80,35 @@ Future<void> speakCongratulations() async {
   );
 }
 
-void main() {
+const FirebaseOptions _webFirebaseOptions = FirebaseOptions(
+  apiKey: "AIzaSyBsLnnK6t7d67fvG3Q-cLQXXWr6NGLemrY",
+  authDomain: "student-scholar-app.firebaseapp.com",
+  databaseURL: "https://student-scholar-app-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "student-scholar-app",
+  storageBucket: "student-scholar-app.firebasestorage.app",
+  messagingSenderId: "339061330507",
+  appId: "1:339061330507:web:6401015172a614a5c9f3ce",
+  measurementId: "G-N8FSMD5Z8N",
+);
+
+Future<void> _initializeFirebase() async {
+  if (Firebase.apps.isNotEmpty) return;
+
+  if (kIsWeb) {
+    await Firebase.initializeApp(options: _webFirebaseOptions);
+    return;
+  }
+
+  await Firebase.initializeApp();
+}
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   tz.initializeTimeZones();
+  await _initializeFirebase();
+  await _loadStoredUploads();
+  await _initializeBackendServices();
   runApp(const MyApp());
-  // Move non-critical background services here
-  _initializeBackendServices();
 }
 
 Future<void> _loadStoredUploads() async {
@@ -297,17 +321,7 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _startApp() async {
-    // 1. Initialize core services while showing splash
-    try {
-      if (Firebase.apps.isEmpty) {
-        await Firebase.initializeApp();
-      }
-      await _loadStoredUploads();
-    } catch (e) {
-      debugPrint("Init error: $e");
-    }
-
-    // Minimized wait time for branding
+    // Core services are initialized before runApp in main()
     await Future.delayed(const Duration(milliseconds: 800));
     
     if (mounted) {
@@ -4052,6 +4066,483 @@ class TransactionHistoryView extends StatelessWidget {
 }
 
 // --- ADMIN CONTROL PANEL ---
+bool get _adminFirebaseReady => Firebase.apps.isNotEmpty;
+
+final List<Map<String, dynamic>> _previewScholars = [
+  {
+    'full_name': 'Juan Dela Cruz',
+    'email': 'juan@example.com',
+    'scholar_number': '2026-01001',
+    'year_level': '1st Year',
+    'applicant_type': 'New Applicant',
+    'course': 'BS Information Technology',
+    'wallet_balance': 2500.0,
+  },
+  {
+    'full_name': 'Maria Clara',
+    'email': 'maria@example.com',
+    'scholar_number': '2026-01002',
+    'year_level': '2nd Year',
+    'applicant_type': 'Renewal Applicant',
+    'course': 'BS Education',
+    'wallet_balance': 3200.0,
+  },
+  {
+    'full_name': 'Pedro Santos',
+    'email': 'pedro@example.com',
+    'scholar_number': '2026-01003',
+    'year_level': 'Grade 12',
+    'applicant_type': 'New Applicant',
+    'course': 'STEM',
+    'wallet_balance': 1800.0,
+  },
+];
+
+final List<Map<String, dynamic>> _previewApplications = [
+  {
+    'grant_title': 'Skolar ng Taytay',
+    'user_id': 'preview-user-001',
+    'status': 'PENDING',
+  },
+  {
+    'grant_title': 'GT REAP STEM',
+    'user_id': 'preview-user-002',
+    'status': 'PASSED',
+  },
+];
+
+final List<Map<String, dynamic>> _previewWithdrawals = [
+  {
+    'amount': 1500.0,
+    'method': 'GCash',
+    'status': 'Pending',
+  },
+  {
+    'amount': 800.0,
+    'method': 'Cash Pickup',
+    'status': 'Completed',
+  },
+];
+
+final List<Map<String, dynamic>> _previewGrants = [
+  {
+    'title': 'Skolar ng Taytay',
+    'slots': '100 Slots',
+    'benefit': '₱15,000 / Semester',
+  },
+  {
+    'title': 'GT REAP STEM',
+    'slots': '50 Slots',
+    'benefit': '₱10,000 / Semester',
+  },
+];
+
+final List<Map<String, dynamic>> _adminRecentActivities = [
+  {
+    'title': 'Juan Dela Cruz submitted a new application',
+    'time': '2 minutes ago',
+    'icon': Icons.person_add_alt_1_outlined,
+    'color': Colors.blue,
+  },
+  {
+    'title': 'GCash Payout processed for Maria Clara',
+    'time': '1 hour ago',
+    'icon': Icons.account_balance_wallet_outlined,
+    'color': Colors.green,
+  },
+  {
+    'title': "New Grant 'GT REAP STEM' published",
+    'time': '3 hours ago',
+    'icon': Icons.campaign_outlined,
+    'color': Colors.purple,
+  },
+  {
+    'title': 'Pedro Santos was added to the scholars list',
+    'time': 'Yesterday',
+    'icon': Icons.people_outline,
+    'color': Colors.indigo,
+  },
+  {
+    'title': 'Admin reviewed a pending withdrawal request',
+    'time': 'Yesterday',
+    'icon': Icons.fact_check_outlined,
+    'color': Colors.orange,
+  },
+];
+
+DateTime? _activityDate(dynamic value) {
+  if (value == null) return null;
+  if (value is Timestamp) return value.toDate();
+  if (value is DateTime) return value;
+  return null;
+}
+
+String _formatActivityTime(DateTime value) {
+  final diff = DateTime.now().difference(value);
+  if (diff.inSeconds < 60) return "Just now";
+  if (diff.inMinutes < 60) return "${diff.inMinutes} minute${diff.inMinutes == 1 ? '' : 's'} ago";
+  if (diff.inHours < 24) return "${diff.inHours} hour${diff.inHours == 1 ? '' : 's'} ago";
+  if (diff.inDays < 7) return "${diff.inDays} day${diff.inDays == 1 ? '' : 's'} ago";
+  return "${value.month}/${value.day}/${value.year}";
+}
+
+String _formatDateTimeValue(dynamic value) {
+  final date = _activityDate(value);
+  if (date == null) return "Not available";
+  final hour = date.hour == 0 ? 12 : (date.hour > 12 ? date.hour - 12 : date.hour);
+  final minute = date.minute.toString().padLeft(2, '0');
+  final period = date.hour >= 12 ? 'PM' : 'AM';
+  return "${date.month}/${date.day}/${date.year} $hour:$minute $period";
+}
+
+List<Map<String, dynamic>> _buildAdminActivityItems({
+  required List<QueryDocumentSnapshot> userDocs,
+  required List<QueryDocumentSnapshot> applicationDocs,
+  required List<QueryDocumentSnapshot> withdrawalDocs,
+  required List<QueryDocumentSnapshot> grantDocs,
+}) {
+  final activities = <Map<String, dynamic>>[];
+  final userNames = <String, String>{};
+
+  for (final doc in userDocs) {
+    final data = doc.data() as Map<String, dynamic>;
+    final fullName = (data['full_name'] ?? 'A scholar').toString();
+    userNames[doc.id] = fullName;
+
+    final createdAt = _activityDate(data['created_at']);
+    if (createdAt != null && doc.id != 'admin_system') {
+      activities.add({
+        'title': '$fullName was added to the scholars list',
+        'time': _formatActivityTime(createdAt),
+        'sortTime': createdAt,
+        'icon': Icons.people_outline,
+        'color': Colors.indigo,
+      });
+    }
+
+    final walletUpdatedAt = _activityDate(data['wallet_updated_at']);
+    if (walletUpdatedAt != null) {
+      activities.add({
+        'title': 'Wallet balance updated for $fullName',
+        'time': _formatActivityTime(walletUpdatedAt),
+        'sortTime': walletUpdatedAt,
+        'icon': Icons.account_balance_wallet_outlined,
+        'color': Colors.teal,
+      });
+    }
+  }
+
+  for (final doc in applicationDocs) {
+    final data = doc.data() as Map<String, dynamic>;
+    final applicant = userNames[data['user_id']] ?? 'A scholar';
+    final submittedAt = _activityDate(data['timestamp']);
+    final reviewedAt = _activityDate(data['reviewed_at']);
+    final status = (data['status'] ?? 'PENDING').toString();
+
+    if (submittedAt != null) {
+      activities.add({
+        'title': '$applicant submitted a new application',
+        'time': _formatActivityTime(submittedAt),
+        'sortTime': submittedAt,
+        'icon': Icons.person_add_alt_1_outlined,
+        'color': Colors.blue,
+      });
+    }
+
+    if (reviewedAt != null && status == 'PASSED') {
+      activities.add({
+        'title': 'Application approved for $applicant',
+        'time': _formatActivityTime(reviewedAt),
+        'sortTime': reviewedAt,
+        'icon': Icons.verified_outlined,
+        'color': Colors.green,
+      });
+    } else if (reviewedAt != null && status == 'FAILED') {
+      activities.add({
+        'title': 'Application rejected for $applicant',
+        'time': _formatActivityTime(reviewedAt),
+        'sortTime': reviewedAt,
+        'icon': Icons.cancel_outlined,
+        'color': Colors.redAccent,
+      });
+    }
+  }
+
+  for (final doc in withdrawalDocs) {
+    final data = doc.data() as Map<String, dynamic>;
+    final userName = userNames[data['user_id']] ?? 'A scholar';
+    final method = (data['method'] ?? 'Payout').toString();
+    final submittedAt = _activityDate(data['timestamp']);
+    final processedAt = _activityDate(data['processed_at']);
+    final status = (data['status'] ?? 'Pending').toString();
+
+    if (submittedAt != null) {
+      activities.add({
+        'title': '$userName requested a payout via $method',
+        'time': _formatActivityTime(submittedAt),
+        'sortTime': submittedAt,
+        'icon': Icons.payments_outlined,
+        'color': Colors.orange,
+      });
+    }
+
+    if (processedAt != null && status == 'Completed') {
+      activities.add({
+        'title': '$method payout processed for $userName',
+        'time': _formatActivityTime(processedAt),
+        'sortTime': processedAt,
+        'icon': Icons.account_balance_wallet_outlined,
+        'color': Colors.green,
+      });
+    } else if (processedAt != null && status == 'Rejected') {
+      activities.add({
+        'title': '$method payout rejected for $userName',
+        'time': _formatActivityTime(processedAt),
+        'sortTime': processedAt,
+        'icon': Icons.money_off_csred_outlined,
+        'color': Colors.redAccent,
+      });
+    }
+  }
+
+  for (final doc in grantDocs) {
+    final data = doc.data() as Map<String, dynamic>;
+    final createdAt = _activityDate(data['created_at']);
+    final title = (data['title'] ?? 'New Grant').toString();
+    if (createdAt != null) {
+      activities.add({
+        'title': "New Grant '$title' published",
+        'time': _formatActivityTime(createdAt),
+        'sortTime': createdAt,
+        'icon': Icons.campaign_outlined,
+        'color': Colors.purple,
+      });
+    }
+  }
+
+  activities.sort((a, b) {
+    final aTime = a['sortTime'] as DateTime?;
+    final bTime = b['sortTime'] as DateTime?;
+    if (aTime == null && bTime == null) return 0;
+    if (aTime == null) return 1;
+    if (bTime == null) return -1;
+    return bTime.compareTo(aTime);
+  });
+
+  return activities;
+}
+
+class AdminRecentActivityFeed extends StatelessWidget {
+  final int? limit;
+  const AdminRecentActivityFeed({super.key, this.limit});
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_adminFirebaseReady) {
+      final items = limit == null
+          ? _adminRecentActivities
+          : _adminRecentActivities.take(limit!).toList();
+      return Column(
+        children: items
+            .map(
+              (activity) => _buildAdminActivityEntry(
+                context,
+                activity['title'] as String,
+                activity['time'] as String,
+                activity['icon'] as IconData,
+                activity['color'] as Color,
+              ),
+            )
+            .toList(),
+      );
+    }
+
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance.collection('users').snapshots(),
+      builder: (context, userSnap) {
+        return StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance.collection('applications').snapshots(),
+          builder: (context, appSnap) {
+            return StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance.collection('withdrawals').snapshots(),
+              builder: (context, withdrawalSnap) {
+                return StreamBuilder<QuerySnapshot>(
+                  stream: FirebaseFirestore.instance.collection('grants').snapshots(),
+                  builder: (context, grantSnap) {
+                    final userDocs = userSnap.data?.docs ?? [];
+                    final applicationDocs = appSnap.data?.docs ?? [];
+                    final withdrawalDocs = withdrawalSnap.data?.docs ?? [];
+                    final grantDocs = grantSnap.data?.docs ?? [];
+
+                    if (!userSnap.hasData &&
+                        !appSnap.hasData &&
+                        !withdrawalSnap.hasData &&
+                        !grantSnap.hasData) {
+                      return const Padding(
+                        padding: EdgeInsets.all(24),
+                        child: Center(child: CircularProgressIndicator()),
+                      );
+                    }
+
+                    final activities = _buildAdminActivityItems(
+                      userDocs: userDocs,
+                      applicationDocs: applicationDocs,
+                      withdrawalDocs: withdrawalDocs,
+                      grantDocs: grantDocs,
+                    );
+
+                    if (activities.isEmpty) {
+                      return Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: const Text(
+                          "No recent activity yet.",
+                          style: TextStyle(color: Colors.grey),
+                        ),
+                      );
+                    }
+
+                    final visibleItems =
+                        limit == null ? activities : activities.take(limit!).toList();
+
+                    return Column(
+                      children: visibleItems
+                          .map(
+                            (activity) => _buildAdminActivityEntry(
+                              context,
+                              activity['title'] as String,
+                              activity['time'] as String,
+                              activity['icon'] as IconData,
+                              activity['color'] as Color,
+                            ),
+                          )
+                          .toList(),
+                    );
+                  },
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+Widget _buildAdminActivityEntry(
+  BuildContext context,
+  String title,
+  String time,
+  IconData icon,
+  Color color,
+) {
+  return Material(
+    color: Colors.transparent,
+    child: InkWell(
+      borderRadius: BorderRadius.circular(16),
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => AdminActivityDetailView(
+              title: title,
+              time: time,
+              icon: icon,
+              color: color,
+            ),
+          ),
+        );
+      },
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.01),
+              blurRadius: 10,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.1),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: 18, color: color),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF342361),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    time,
+                    style: const TextStyle(color: Colors.grey, fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+Widget _buildAdminPreviewBanner() {
+  return Container(
+    margin: const EdgeInsets.only(bottom: 20),
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: Colors.orange.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: Colors.orange.withValues(alpha: 0.35)),
+    ),
+    child: const Row(
+      children: [
+        Icon(Icons.visibility_outlined, color: Colors.orange),
+        SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            "Preview mode: Firebase web is not connected, so admin data is using sample content for UI editing.",
+            style: TextStyle(
+              color: Color(0xFF7A4B00),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+void _showPreviewMessage(BuildContext context, String message) {
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text(message)),
+  );
+}
+
 class AdminDashboardView extends StatefulWidget {
   const AdminDashboardView({super.key});
 
@@ -4082,7 +4573,9 @@ class _AdminDashboardViewState extends State<AdminDashboardView> {
               icon: const Icon(Icons.logout, color: Colors.redAccent, size: 20),
               tooltip: "Logout",
               onPressed: () async {
-                await FirebaseAuth.instance.signOut();
+                if (_adminFirebaseReady) {
+                  await FirebaseAuth.instance.signOut();
+                }
                 if (context.mounted) {
                   Navigator.pushAndRemoveUntil(
                     context,
@@ -4154,6 +4647,7 @@ class AdminOverview extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.all(24),
       children: [
+        if (!_adminFirebaseReady) _buildAdminPreviewBanner(),
         const Row(
           children: [
             Icon(Icons.analytics_outlined, color: Color(0xFF342361), size: 28),
@@ -4171,39 +4665,61 @@ class AdminOverview extends StatelessWidget {
         const SizedBox(height: 24),
         
         // Dynamic stats from Firestore
-        StreamBuilder<QuerySnapshot>(
-          stream: FirebaseFirestore.instance.collection('users').snapshots(),
-          builder: (context, userSnap) {
-            return StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance.collection('applications').snapshots(),
-              builder: (context, appSnap) {
-                return StreamBuilder<QuerySnapshot>(
-                  stream: FirebaseFirestore.instance.collection('withdrawals').snapshots(),
-                  builder: (context, withdrawSnap) {
-                    final totalScholars = userSnap.hasData ? userSnap.data!.docs.length : 0;
-                    final pendingApps = appSnap.hasData ? appSnap.data!.docs.where((d) => d['status'] == 'PENDING').length : 0;
-                    final pendingWithdraws = withdrawSnap.hasData ? withdrawSnap.data!.docs.where((d) => d['status'] == 'Pending').length : 0;
-                    
-                    return GridView.count(
-                      shrinkWrap: true,
-                      physics: const NeverScrollableScrollPhysics(),
-                      crossAxisCount: 2,
-                      crossAxisSpacing: 16,
-                      mainAxisSpacing: 16,
-                      childAspectRatio: 1.1,
-                      children: [
-                        _buildStatCard("Total Scholars", totalScholars.toString(), Icons.people, Colors.blue),
-                        _buildStatCard("Pending Apps", pendingApps.toString(), Icons.assignment, Colors.orange),
-                        _buildStatCard("Pending Payouts", pendingWithdraws.toString(), Icons.payments, Colors.green),
-                        _buildStatCard("Active Grants", "7", Icons.campaign, Colors.purple),
-                      ],
-                    );
-                  }
-                );
-              }
-            );
-          }
-        ),
+        _adminFirebaseReady
+            ? StreamBuilder<QuerySnapshot>(
+                stream: FirebaseFirestore.instance.collection('users').snapshots(),
+                builder: (context, userSnap) {
+                  return StreamBuilder<QuerySnapshot>(
+                    stream: FirebaseFirestore.instance.collection('applications').snapshots(),
+                    builder: (context, appSnap) {
+                      return StreamBuilder<QuerySnapshot>(
+                        stream: FirebaseFirestore.instance.collection('withdrawals').snapshots(),
+                        builder: (context, withdrawSnap) {
+                          final totalScholars = userSnap.hasData ? userSnap.data!.docs.length : 0;
+                          final pendingApps = appSnap.hasData ? appSnap.data!.docs.where((d) => d['status'] == 'PENDING').length : 0;
+                          final pendingWithdraws = withdrawSnap.hasData ? withdrawSnap.data!.docs.where((d) => d['status'] == 'Pending').length : 0;
+                          
+                          return StreamBuilder<QuerySnapshot>(
+                            stream: FirebaseFirestore.instance.collection('grants').snapshots(),
+                            builder: (context, grantSnap) {
+                              final activeGrants = grantSnap.hasData ? grantSnap.data!.docs.length : 0;
+
+                              return GridView.count(
+                                shrinkWrap: true,
+                                physics: const NeverScrollableScrollPhysics(),
+                                crossAxisCount: 2,
+                                crossAxisSpacing: 16,
+                                mainAxisSpacing: 16,
+                                childAspectRatio: 1.1,
+                                children: [
+                                  _buildStatCard("Total Scholars", totalScholars.toString(), Icons.people, Colors.blue),
+                                  _buildStatCard("Pending Apps", pendingApps.toString(), Icons.assignment, Colors.orange),
+                                  _buildStatCard("Pending Payouts", pendingWithdraws.toString(), Icons.payments, Colors.green),
+                                  _buildStatCard("Active Grants", activeGrants.toString(), Icons.campaign, Colors.purple),
+                                ],
+                              );
+                            },
+                          );
+                        },
+                      );
+                    },
+                  );
+                },
+              )
+            : GridView.count(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                crossAxisCount: 2,
+                crossAxisSpacing: 16,
+                mainAxisSpacing: 16,
+                childAspectRatio: 1.1,
+                children: [
+                  _buildStatCard("Total Scholars", _previewScholars.length.toString(), Icons.people, Colors.blue),
+                  _buildStatCard("Pending Apps", "1", Icons.assignment, Colors.orange),
+                  _buildStatCard("Pending Payouts", "1", Icons.payments, Colors.green),
+                  _buildStatCard("Active Grants", _previewGrants.length.toString(), Icons.campaign, Colors.purple),
+                ],
+              ),
         const SizedBox(height: 32),
         // Added button to access Scholars List
         ElevatedButton.icon(
@@ -4234,30 +4750,20 @@ class AdminOverview extends StatelessWidget {
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF342361)),
             ),
             TextButton(
-              onPressed: () {},
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const AdminRecentActivityView(),
+                  ),
+                );
+              },
               child: const Text("View All", style: TextStyle(color: Color(0xFF4F378A))),
             ),
           ],
         ),
         const SizedBox(height: 8),
-        _buildActivityTile(
-          "Juan Dela Cruz submitted a new application",
-          "2 minutes ago",
-          Icons.person_add_alt_1_outlined,
-          Colors.blue,
-        ),
-        _buildActivityTile(
-          "GCash Payout processed for Maria Clara",
-          "1 hour ago",
-          Icons.account_balance_wallet_outlined,
-          Colors.green,
-        ),
-        _buildActivityTile(
-          "New Grant 'GT REAP STEM' published",
-          "3 hours ago",
-          Icons.campaign_outlined,
-          Colors.purple,
-        ),
+        const AdminRecentActivityFeed(limit: 3),
       ],
     );
   }
@@ -4312,54 +4818,191 @@ class AdminOverview extends StatelessWidget {
       ),
     );
   }
+}
 
-  Widget _buildActivityTile(String title, String time, IconData icon, Color color) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.01),
-            blurRadius: 10,
-            offset: const Offset(0, 2),
-          ),
+class AdminRecentActivityView extends StatelessWidget {
+  const AdminRecentActivityView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F7FF),
+      appBar: AppBar(
+        title: const Text("Recent Activity"),
+        backgroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          if (!_adminFirebaseReady) _buildAdminPreviewBanner(),
+          const AdminRecentActivityFeed(),
         ],
       ),
-      child: Row(
+    );
+  }
+}
+
+class AdminActivityDetailView extends StatelessWidget {
+  final String title;
+  final String time;
+  final IconData icon;
+  final Color color;
+
+  const AdminActivityDetailView({
+    super.key,
+    required this.title,
+    required this.time,
+    required this.icon,
+    required this.color,
+  });
+
+  String get _activityType {
+    final lower = title.toLowerCase();
+    if (lower.contains('application')) return 'Application Update';
+    if (lower.contains('payout') || lower.contains('withdrawal')) return 'Fund Transaction';
+    if (lower.contains('grant')) return 'Grant Management';
+    if (lower.contains('scholar')) return 'Scholar Record';
+    if (lower.contains('wallet balance')) return 'Scholar Record';
+    return 'Admin Activity';
+  }
+
+  String get _activityDescription {
+    final lower = title.toLowerCase();
+    if (lower.contains('submitted a new application')) {
+      return 'A scholar submitted a new application and it is waiting for review in the Applications tab.';
+    }
+    if (lower.contains('application approved')) {
+      return 'An admin approved an application from the Applications tab and the status was saved to Firestore.';
+    }
+    if (lower.contains('application rejected')) {
+      return 'An admin rejected an application from the Applications tab and the updated status was saved to Firestore.';
+    }
+    if (lower.contains('requested a payout')) {
+      return 'A scholar submitted a withdrawal request and it is now visible in the Funds tab for admin review.';
+    }
+    if (lower.contains('payout processed')) {
+      return 'A payout request was processed and its fund transaction status should now appear as completed.';
+    }
+    if (lower.contains('payout rejected')) {
+      return 'A payout request was reviewed in the Funds tab and marked as rejected.';
+    }
+    if (lower.contains('grant')) {
+      return 'A grant record was created or published from the grant management section.';
+    }
+    if (lower.contains('added to the scholars list')) {
+      return 'A scholar profile was added or synced into the users collection for admin management.';
+    }
+    if (lower.contains('wallet balance updated')) {
+      return 'A scholar wallet balance was updated from the admin scholar management screen.';
+    }
+    if (lower.contains('reviewed')) {
+      return 'An admin reviewed a pending financial request and updated its status in the funds section.';
+    }
+    return 'This activity was recorded by the admin dashboard as part of the current system timeline.';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F7FF),
+      appBar: AppBar(
+        title: const Text("Activity Details"),
+        backgroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
         children: [
           Container(
-            padding: const EdgeInsets.all(10),
+            padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.1),
-              shape: BoxShape.circle,
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.03),
+                  blurRadius: 14,
+                  offset: const Offset(0, 4),
+                ),
+              ],
             ),
-            child: Icon(icon, size: 18, color: color),
-          ),
-          const SizedBox(width: 16),
-          Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: color, size: 28),
+                ),
+                const SizedBox(height: 20),
                 Text(
                   title,
                   style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
                     color: Color(0xFF342361),
                   ),
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: 12),
+                _buildDetailRow("Type", _activityType),
+                _buildDetailRow("Time", time),
+                _buildDetailRow("Status", "Recorded"),
+                const SizedBox(height: 20),
+                const Text(
+                  "Description",
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF342361),
+                  ),
+                ),
+                const SizedBox(height: 8),
                 Text(
-                  time,
-                  style: const TextStyle(color: Colors.grey, fontSize: 11),
+                  _activityDescription,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    height: 1.5,
+                    color: Colors.black87,
+                  ),
                 ),
               ],
             ),
           ),
-          const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDetailRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 72,
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.grey,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                color: Color(0xFF342361),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -4373,6 +5016,68 @@ class AdminScholarDetailView extends StatefulWidget {
 
   @override
   State<AdminScholarDetailView> createState() => _AdminScholarDetailViewState();
+}
+
+class AdminScholarPreviewView extends StatelessWidget {
+  final Map<String, dynamic> scholarData;
+  const AdminScholarPreviewView({super.key, required this.scholarData});
+
+  @override
+  Widget build(BuildContext context) {
+    final double balance = (scholarData['wallet_balance'] ?? 0.0).toDouble();
+
+    return Scaffold(
+      appBar: AppBar(title: const Text("Manage Scholar")),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          _buildAdminPreviewBanner(),
+          const CircleAvatar(radius: 40, backgroundColor: Color(0xFF4F378A), child: Icon(Icons.person, size: 40, color: Colors.white)),
+          const SizedBox(height: 16),
+          Center(child: Text(scholarData['full_name'] ?? "No Name", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold))),
+          Center(child: Text(scholarData['email'] ?? "", style: const TextStyle(color: Colors.grey))),
+          const SizedBox(height: 32),
+          const Text("Financial Management", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: Colors.grey.shade200),
+            ),
+            child: Text("Wallet Balance: ₱${balance.toStringAsFixed(2)}", style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton(
+            onPressed: () => _showPreviewMessage(context, "Preview mode only: connect Firebase web config to save admin changes."),
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4F378A), foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 50)),
+            child: const Text("Update Balance"),
+          ),
+          const SizedBox(height: 32),
+          const Text("Scholarship Info", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          const SizedBox(height: 8),
+          _infoTile("Scholar Number", scholarData['scholar_number']),
+          _infoTile("Applicant Type", scholarData['applicant_type']),
+          _infoTile("Year Level", scholarData['year_level']),
+          _infoTile("Course", scholarData['course']),
+        ],
+      ),
+    );
+  }
+
+  Widget _infoTile(String label, dynamic value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.grey)),
+          Text(value?.toString() ?? "Not set", style: const TextStyle(fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
 }
 
 class _AdminScholarDetailViewState extends State<AdminScholarDetailView> {
@@ -4417,6 +5122,7 @@ class _AdminScholarDetailViewState extends State<AdminScholarDetailView> {
               double newBalance = double.tryParse(_balanceController.text) ?? 0.0;
               await FirebaseFirestore.instance.collection('users').doc(widget.scholarDoc.id).update({
                 'wallet_balance': newBalance,
+                'wallet_updated_at': FieldValue.serverTimestamp(),
               });
               if (context.mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Balance updated successfully")));
@@ -4457,6 +5163,63 @@ class AdminScholarsList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (!_adminFirebaseReady) {
+      return ListView.builder(
+        padding: const EdgeInsets.all(24),
+        itemCount: _previewScholars.length + 1,
+        itemBuilder: (context, index) {
+          if (index == 0) return _buildAdminPreviewBanner();
+          final data = _previewScholars[index - 1];
+          final double balance = (data['wallet_balance'] ?? 0.0).toDouble();
+
+          return Container(
+            margin: const EdgeInsets.only(bottom: 12),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(color: Colors.black.withValues(alpha: 0.02), blurRadius: 5)
+              ],
+            ),
+            child: ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+              leading: CircleAvatar(
+                backgroundColor: const Color(0xFF4F378A).withValues(alpha: 0.1),
+                child: const Icon(Icons.person, color: Color(0xFF4F378A)),
+              ),
+              title: Text(
+                data['full_name'] ?? "No Name",
+                style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF342361)),
+              ),
+              subtitle: Text(
+                "${data['scholar_number'] ?? 'No ID'} • ${data['year_level'] ?? 'N/A'}",
+                style: const TextStyle(fontSize: 12),
+              ),
+              trailing: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    "₱${balance.toStringAsFixed(2)}",
+                    style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green),
+                  ),
+                  const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
+                ],
+              ),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => AdminScholarPreviewView(scholarData: data),
+                  ),
+                );
+              },
+            ),
+          );
+        },
+      );
+    }
+
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance.collection('users').snapshots(),
       builder: (context, snapshot) {
@@ -4528,6 +5291,100 @@ class AdminApplicationsList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (!_adminFirebaseReady) {
+      return ListView.builder(
+        padding: const EdgeInsets.all(24),
+        itemCount: _previewApplications.length + 1,
+        itemBuilder: (context, index) {
+          if (index == 0) return _buildAdminPreviewBanner();
+          final data = _previewApplications[index - 1];
+          final String status = data['status'] ?? "PENDING";
+
+          return Container(
+            margin: const EdgeInsets.only(bottom: 20),
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(24),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.03),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        data['grant_title'] ?? "Unknown Grant",
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Color(0xFF342361)),
+                      ),
+                    ),
+                    _buildStatusBadge(status),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Icon(Icons.person_outline, size: 14, color: Colors.grey),
+                    const SizedBox(width: 8),
+                    Text("User ID: ${data['user_id']}", style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                if (status == "PENDING")
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _showPreviewMessage(context, "Preview mode only: application rejection is disabled."),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.red,
+                            side: const BorderSide(color: Colors.red),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                          ),
+                          child: const Text("Reject", style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () => _showPreviewMessage(context, "Preview mode only: application approval is disabled."),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.green,
+                            foregroundColor: Colors.white,
+                            elevation: 0,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                          ),
+                          child: const Text("Approve", style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                      ),
+                    ],
+                  )
+                else
+                  const Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      Text("Decision Finalized", style: TextStyle(color: Colors.black26, fontSize: 12, fontStyle: FontStyle.italic)),
+                      SizedBox(width: 8),
+                      Icon(Icons.check_circle_outline, size: 16, color: Colors.black12),
+                    ],
+                  ),
+              ],
+            ),
+          );
+        },
+      );
+    }
+
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance.collection('applications').orderBy('timestamp', descending: true).snapshots(),
       builder: (context, snapshot) {
@@ -4597,7 +5454,10 @@ class AdminApplicationsList extends StatelessWidget {
                       children: [
                         Expanded(
                           child: OutlinedButton(
-                            onPressed: () => FirebaseFirestore.instance.collection('applications').doc(docs[index].id).update({'status': 'FAILED'}),
+                            onPressed: () => FirebaseFirestore.instance.collection('applications').doc(docs[index].id).update({
+                              'status': 'FAILED',
+                              'reviewed_at': FieldValue.serverTimestamp(),
+                            }),
                             style: OutlinedButton.styleFrom(
                               foregroundColor: Colors.red,
                               side: const BorderSide(color: Colors.red),
@@ -4611,7 +5471,10 @@ class AdminApplicationsList extends StatelessWidget {
                         Expanded(
                           child: ElevatedButton(
                             onPressed: () async {
-                              await FirebaseFirestore.instance.collection('applications').doc(docs[index].id).update({'status': 'PASSED'});
+                              await FirebaseFirestore.instance.collection('applications').doc(docs[index].id).update({
+                                'status': 'PASSED',
+                                'reviewed_at': FieldValue.serverTimestamp(),
+                              });
                               globalNotifications.insert(0, AppNotification(
                                 title: "Grant Approved!",
                                 body: "Your application for ${data['grant_title']} has been approved.",
@@ -4676,6 +5539,70 @@ class AdminWithdrawalsList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (!_adminFirebaseReady) {
+      return ListView.builder(
+        padding: const EdgeInsets.all(24),
+        itemCount: _previewWithdrawals.length + 1,
+        itemBuilder: (context, index) {
+          if (index == 0) return _buildAdminPreviewBanner();
+          final data = _previewWithdrawals[index - 1];
+          final String status = data['status'] ?? "Pending";
+          final double amount = (data['amount'] ?? 0.0).toDouble();
+
+          return Container(
+            margin: const EdgeInsets.only(bottom: 16),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [
+                BoxShadow(color: Colors.black.withValues(alpha: 0.02), blurRadius: 10)
+              ],
+            ),
+            child: ListTile(
+              leading: CircleAvatar(
+                backgroundColor: status == "Pending" ? Colors.orange.withValues(alpha: 0.1) : Colors.green.withValues(alpha: 0.1),
+                child: Icon(
+                  status == "Pending" ? Icons.hourglass_empty : Icons.check,
+                  color: status == "Pending" ? Colors.orange : Colors.green,
+                  size: 20,
+                ),
+              ),
+              title: Text(
+                "₱${amount.toStringAsFixed(2)}",
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+              ),
+              subtitle: Text("Method: ${data['method'] ?? 'Payout'} • $status"),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (status == "Pending") ...[
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.redAccent),
+                      onPressed: () => _showPreviewMessage(context, "Preview mode only: payout rejection is disabled."),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.check, color: Colors.green),
+                      onPressed: () => _showPreviewMessage(context, "Preview mode only: payout completion is disabled."),
+                    ),
+                  ],
+                  const Icon(Icons.chevron_right, size: 20, color: Colors.grey),
+                ],
+              ),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => AdminWithdrawalPreviewDetailView(withdrawalData: data),
+                  ),
+                );
+              },
+            ),
+          );
+        },
+      );
+    }
+
     return StreamBuilder<QuerySnapshot>(
       stream: FirebaseFirestore.instance.collection('withdrawals').orderBy('timestamp', descending: true).snapshots(),
       builder: (context, snapshot) {
@@ -4727,19 +5654,38 @@ class AdminWithdrawalsList extends StatelessWidget {
                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
                 ),
                 subtitle: Text("Method: ${data['method'] ?? 'Payout'} • $status"),
-                trailing: status == "Pending" ? Row(
+                trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    IconButton(
-                      icon: const Icon(Icons.close, color: Colors.redAccent),
-                      onPressed: () => FirebaseFirestore.instance.collection('withdrawals').doc(docs[index].id).update({'status': 'Rejected'}),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.check, color: Colors.green),
-                      onPressed: () => FirebaseFirestore.instance.collection('withdrawals').doc(docs[index].id).update({'status': 'Completed'}),
-                    ),
+                    if (status == "Pending") ...[
+                      IconButton(
+                        icon: const Icon(Icons.close, color: Colors.redAccent),
+                        onPressed: () => FirebaseFirestore.instance.collection('withdrawals').doc(docs[index].id).update({
+                          'status': 'Rejected',
+                          'processed_at': FieldValue.serverTimestamp(),
+                        }),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.check, color: Colors.green),
+                        onPressed: () => FirebaseFirestore.instance.collection('withdrawals').doc(docs[index].id).update({
+                          'status': 'Completed',
+                          'processed_at': FieldValue.serverTimestamp(),
+                        }),
+                      ),
+                    ],
+                    const Icon(Icons.chevron_right, size: 20, color: Colors.grey),
                   ],
-                ) : null,
+                ),
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => AdminWithdrawalDetailView(
+                        withdrawalDoc: docs[index],
+                      ),
+                    ),
+                  );
+                },
               ),
             );
           },
@@ -4747,6 +5693,274 @@ class AdminWithdrawalsList extends StatelessWidget {
       },
     );
   }
+}
+
+class AdminWithdrawalPreviewDetailView extends StatelessWidget {
+  final Map<String, dynamic> withdrawalData;
+  const AdminWithdrawalPreviewDetailView({super.key, required this.withdrawalData});
+
+  @override
+  Widget build(BuildContext context) {
+    final status = (withdrawalData['status'] ?? 'Pending').toString();
+    final amount = (withdrawalData['amount'] ?? 0.0).toDouble();
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F7FF),
+      appBar: AppBar(
+        title: const Text("Payout Details"),
+        backgroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          _buildAdminPreviewBanner(),
+          _buildWithdrawalDetailCard(
+            amount: amount,
+            method: (withdrawalData['method'] ?? 'Payout').toString(),
+            status: status,
+            requestedBy: (withdrawalData['user_id'] ?? 'Preview User').toString(),
+            requestedAt: "Preview data",
+            processedAt: status == 'Pending' ? "Not processed yet" : "Preview data",
+          ),
+          const SizedBox(height: 24),
+          if (status == 'Pending') ...[
+            OutlinedButton(
+              onPressed: () => _showPreviewMessage(context, "Preview mode only: payout rejection is disabled."),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.redAccent,
+                side: const BorderSide(color: Colors.redAccent),
+                minimumSize: const Size(double.infinity, 50),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+              child: const Text("Reject Request"),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: () => _showPreviewMessage(context, "Preview mode only: payout completion is disabled."),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(double.infinity, 50),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+              child: const Text("Approve Request"),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class AdminWithdrawalDetailView extends StatelessWidget {
+  final QueryDocumentSnapshot withdrawalDoc;
+  const AdminWithdrawalDetailView({super.key, required this.withdrawalDoc});
+
+  @override
+  Widget build(BuildContext context) {
+    final data = withdrawalDoc.data() as Map<String, dynamic>;
+    final status = (data['status'] ?? 'Pending').toString();
+    final amount = (data['amount'] ?? 0.0).toDouble();
+    final userId = (data['user_id'] ?? '').toString();
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF8F7FF),
+      appBar: AppBar(
+        title: const Text("Payout Details"),
+        backgroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          StreamBuilder<DocumentSnapshot>(
+            stream: FirebaseFirestore.instance.collection('users').doc(userId).snapshots(),
+            builder: (context, userSnapshot) {
+              final userData = userSnapshot.data?.data() as Map<String, dynamic>?;
+              final requestedBy =
+                  (userData?['full_name'] ?? userData?['email'] ?? userId).toString();
+
+              return _buildWithdrawalDetailCard(
+                amount: amount,
+                method: (data['method'] ?? 'Payout').toString(),
+                status: status,
+                requestedBy: requestedBy.isEmpty ? "Unknown User" : requestedBy,
+                requestedAt: _formatDateTimeValue(data['timestamp']),
+                processedAt: status == 'Pending'
+                    ? "Not processed yet"
+                    : _formatDateTimeValue(data['processed_at']),
+              );
+            },
+          ),
+          const SizedBox(height: 24),
+          if (status == 'Pending') ...[
+            OutlinedButton(
+              onPressed: () async {
+                await FirebaseFirestore.instance.collection('withdrawals').doc(withdrawalDoc.id).update({
+                  'status': 'Rejected',
+                  'processed_at': FieldValue.serverTimestamp(),
+                });
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text("Payout rejected")),
+                  );
+                  Navigator.pop(context);
+                }
+              },
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.redAccent,
+                side: const BorderSide(color: Colors.redAccent),
+                minimumSize: const Size(double.infinity, 50),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+              child: const Text("Reject Request"),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: () async {
+                await FirebaseFirestore.instance.collection('withdrawals').doc(withdrawalDoc.id).update({
+                  'status': 'Completed',
+                  'processed_at': FieldValue.serverTimestamp(),
+                });
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text("Payout approved")),
+                  );
+                  Navigator.pop(context);
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(double.infinity, 50),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+              child: const Text("Approve Request"),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+Widget _buildWithdrawalDetailCard({
+  required double amount,
+  required String method,
+  required String status,
+  required String requestedBy,
+  required String requestedAt,
+  required String processedAt,
+}) {
+  final statusColor = status == 'Completed'
+      ? Colors.green
+      : status == 'Rejected'
+          ? Colors.redAccent
+          : Colors.orange;
+
+  return Container(
+    padding: const EdgeInsets.all(20),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(20),
+      boxShadow: [
+        BoxShadow(
+          color: Colors.black.withValues(alpha: 0.03),
+          blurRadius: 14,
+          offset: const Offset(0, 4),
+        ),
+      ],
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            CircleAvatar(
+              radius: 24,
+              backgroundColor: statusColor.withValues(alpha: 0.12),
+              child: Icon(
+                status == 'Pending'
+                    ? Icons.hourglass_empty
+                    : status == 'Completed'
+                        ? Icons.check
+                        : Icons.close,
+                color: statusColor,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "₱${amount.toStringAsFixed(2)}",
+                    style: const TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF342361),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: statusColor.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      status,
+                      style: TextStyle(
+                        color: statusColor,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        _buildWithdrawalInfoRow("Method", method),
+        _buildWithdrawalInfoRow("Requested By", requestedBy),
+        _buildWithdrawalInfoRow("Requested At", requestedAt),
+        _buildWithdrawalInfoRow("Processed At", processedAt),
+      ],
+    ),
+  );
+}
+
+Widget _buildWithdrawalInfoRow(String label, String value) {
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 96,
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: Colors.grey,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        Expanded(
+          child: Text(
+            value,
+            style: const TextStyle(
+              color: Color(0xFF342361),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 // --- ADMIN GRANTS TAB ---
@@ -4773,35 +5987,60 @@ class AdminGrantsManagement extends StatelessWidget {
           ),
           const SizedBox(height: 24),
           Expanded(
-            child: StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance.collection('grants').snapshots(),
-              builder: (context, snapshot) {
-                if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-                var docs = snapshot.data!.docs;
-                
-                if (docs.isEmpty) {
-                  return const Center(child: Text("No grants found. Click 'New Grant' to add one."));
-                }
-
-                return ListView.builder(
-                  itemCount: docs.length,
-                  itemBuilder: (context, index) {
-                    var data = docs[index].data() as Map<String, dynamic>;
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      child: ListTile(
-                        title: Text(data['title'] ?? "Scholarship"),
-                        subtitle: Text("${data['slots'] ?? 'N/A'} • ${data['benefit'] ?? 'N/A'}"),
-                        trailing: IconButton(
-                          icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-                          onPressed: () => FirebaseFirestore.instance.collection('grants').doc(docs[index].id).delete(),
+            child: !_adminFirebaseReady
+                ? Column(
+                    children: [
+                      _buildAdminPreviewBanner(),
+                      Expanded(
+                        child: ListView.builder(
+                          itemCount: _previewGrants.length,
+                          itemBuilder: (context, index) {
+                            final data = _previewGrants[index];
+                            return Card(
+                              margin: const EdgeInsets.only(bottom: 12),
+                              child: ListTile(
+                                title: Text(data['title'] ?? "Scholarship"),
+                                subtitle: Text("${data['slots'] ?? 'N/A'} • ${data['benefit'] ?? 'N/A'}"),
+                                trailing: IconButton(
+                                  icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                                  onPressed: () => _showPreviewMessage(context, "Preview mode only: deleting grants is disabled."),
+                                ),
+                              ),
+                            );
+                          },
                         ),
                       ),
-                    );
-                  },
-                );
-              },
-            ),
+                    ],
+                  )
+                : StreamBuilder<QuerySnapshot>(
+                    stream: FirebaseFirestore.instance.collection('grants').snapshots(),
+                    builder: (context, snapshot) {
+                      if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+                      var docs = snapshot.data!.docs;
+
+                      if (docs.isEmpty) {
+                        return const Center(child: Text("No grants found. Click 'New Grant' to add one."));
+                      }
+
+                      return ListView.builder(
+                        itemCount: docs.length,
+                        itemBuilder: (context, index) {
+                          var data = docs[index].data() as Map<String, dynamic>;
+                          return Card(
+                            margin: const EdgeInsets.only(bottom: 12),
+                            child: ListTile(
+                              title: Text(data['title'] ?? "Scholarship"),
+                              subtitle: Text("${data['slots'] ?? 'N/A'} • ${data['benefit'] ?? 'N/A'}"),
+                              trailing: IconButton(
+                                icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                                onPressed: () => FirebaseFirestore.instance.collection('grants').doc(docs[index].id).delete(),
+                              ),
+                            ),
+                          );
+                        },
+                      );
+                    },
+                  ),
           )
         ],
       ),
@@ -4830,13 +6069,21 @@ class AdminGrantsManagement extends StatelessWidget {
           ElevatedButton(
             onPressed: () async {
               if (titleController.text.isNotEmpty) {
-                await FirebaseFirestore.instance.collection('grants').add({
-                  'title': titleController.text,
-                  'slots': slotsController.text,
-                  'benefit': benefitController.text,
-                  'color': '0xFF4F378A',
-                });
-                if (context.mounted) Navigator.pop(context);
+                if (_adminFirebaseReady) {
+                  await FirebaseFirestore.instance.collection('grants').add({
+                    'title': titleController.text,
+                    'slots': slotsController.text,
+                    'benefit': benefitController.text,
+                    'color': '0xFF4F378A',
+                    'created_at': FieldValue.serverTimestamp(),
+                  });
+                  if (context.mounted) Navigator.pop(context);
+                } else {
+                  if (context.mounted) {
+                    Navigator.pop(context);
+                    _showPreviewMessage(context, "Preview mode only: adding grants is disabled until Firebase web is configured.");
+                  }
+                }
               }
             },
             child: const Text("Add"),
