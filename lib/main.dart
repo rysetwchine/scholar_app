@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:io';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest.dart' as tz;
 import 'package:flutter_tts/flutter_tts.dart';
@@ -6,10 +7,24 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:geocoding/geocoding.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:local_auth/local_auth.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'dart:convert';
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 final FlutterTts flutterTts = FlutterTts();
+
+// Global map to track all document uploads across folders
+final Map<String, Map<String, dynamic>> globalUploads = {};
+
+// Global Theme Notifier
+final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
 
 // --- NOTIFICATION DATA MODEL ---
 class AppNotification {
@@ -29,6 +44,31 @@ class AppNotification {
 // Global list to store notifications for the in-app view
 final List<AppNotification> globalNotifications = [];
 bool isScholarAlertEnabled = true;
+bool isBiometricEnabled = false;
+
+final LocalAuthentication auth = LocalAuthentication();
+
+Future<bool> authenticateUser(BuildContext context) async {
+  if (!isBiometricEnabled) return true;
+  
+  try {
+    final bool canAuthenticateWithBiometrics = await auth.canCheckBiometrics;
+    final bool canAuthenticate = canAuthenticateWithBiometrics || await auth.isDeviceSupported();
+    
+    if (!canAuthenticate) return true;
+
+    return await auth.authenticate(
+      localizedReason: 'Please authenticate to access your Scholar Dashboard',
+      options: const AuthenticationOptions(
+        stickyAuth: true,
+        biometricOnly: false, // Allow fallback to PIN/Pattern if biometrics fail
+      ),
+    );
+  } catch (e) {
+    debugPrint("Biometric error: $e");
+    return false;
+  }
+}
 
 // Helper function to play the congratulatory voice message
 Future<void> speakCongratulations() async {
@@ -39,21 +79,65 @@ Future<void> speakCongratulations() async {
   );
 }
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
   tz.initializeTimeZones();
-
-  // Load the app first so the user doesn't see a white screen
   runApp(const MyApp());
-
-  // Initialize Firebase and Notifications in the background
-  _initializeBackend();
+  // Move non-critical background services here
+  _initializeBackendServices();
 }
 
-Future<void> _initializeBackend() async {
+Future<void> _loadStoredUploads() async {
   try {
-    await Firebase.initializeApp();
+    final prefs = await SharedPreferences.getInstance();
+    isBiometricEnabled = prefs.getBool('biometric_enabled') ?? false;
+    
+    // Load theme preference
+    final String? themeStr = prefs.getString('theme_mode');
+    if (themeStr != null) {
+      themeNotifier.value = ThemeMode.values.firstWhere(
+        (m) => m.toString() == themeStr,
+        orElse: () => ThemeMode.light,
+      );
+    }
 
+    final String? encodedData = prefs.getString('persisted_uploads');
+    if (encodedData != null) {
+      final Map<String, dynamic> decodedMap = json.decode(encodedData);
+      globalUploads.clear();
+      decodedMap.forEach((key, value) {
+        // Convert timestamp string back to DateTime
+        if (value is Map<String, dynamic> && value.containsKey('timestamp')) {
+          value['timestamp'] = DateTime.parse(value['timestamp']);
+        }
+        globalUploads[key] = value;
+      });
+    }
+  } catch (e) {
+    debugPrint("Error loading uploads: $e");
+  }
+}
+
+Future<void> _saveUploadsToDisk() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    // Create a copy to avoid modifying the original during serialization
+    final Map<String, dynamic> serializableMap = {};
+    globalUploads.forEach((key, value) {
+      final Map<String, dynamic> item = Map.from(value);
+      if (item['timestamp'] is DateTime) {
+        item['timestamp'] = (item['timestamp'] as DateTime).toIso8601String();
+      }
+      serializableMap[key] = item;
+    });
+    await prefs.setString('persisted_uploads', json.encode(serializableMap));
+  } catch (e) {
+    debugPrint("Error saving uploads: $e");
+  }
+}
+
+Future<void> _initializeBackendServices() async {
+  try {
     // Initialize a default admin doc if it doesn't exist for management
     final adminDoc = await FirebaseFirestore.instance.collection('users').doc('admin_system').get();
     if (!adminDoc.exists) {
@@ -104,7 +188,7 @@ Future<void> _initializeBackend() async {
       );
     });
   } catch (e) {
-    debugPrint("Backend initialization error: $e");
+    debugPrint("Backend services error: $e");
   }
 }
 
@@ -150,26 +234,49 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Scholarship Management',
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.light,
-        colorSchemeSeed: const Color(0xFF4F378A), // Deep Purple
-        scaffoldBackgroundColor: const Color(0xFFF3EDFF), // Light Lavender Background
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFFF3EDFF),
-          elevation: 0,
-          centerTitle: true,
-          titleTextStyle: TextStyle(
-              color: Color(0xFF342361),
-              fontSize: 20,
-              fontWeight: FontWeight.bold),
-          iconTheme: IconThemeData(color: Color(0xFF342361)),
-        ),
-      ),
-      home: const SplashScreen(),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeNotifier,
+      builder: (context, currentMode, child) {
+        return MaterialApp(
+          debugShowCheckedModeBanner: false,
+          title: 'Scholarship Management',
+          themeMode: currentMode,
+          theme: ThemeData(
+            useMaterial3: true,
+            brightness: Brightness.light,
+            colorSchemeSeed: const Color(0xFF4F378A), // Deep Purple
+            scaffoldBackgroundColor: const Color(0xFFF3EDFF), // Light Lavender Background
+            appBarTheme: const AppBarTheme(
+              backgroundColor: Color(0xFFF3EDFF),
+              elevation: 0,
+              centerTitle: true,
+              titleTextStyle: TextStyle(
+                  color: Color(0xFF342361),
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold),
+              iconTheme: IconThemeData(color: Color(0xFF342361)),
+            ),
+          ),
+          darkTheme: ThemeData(
+            useMaterial3: true,
+            brightness: Brightness.dark,
+            colorSchemeSeed: const Color(0xFF4F378A),
+            scaffoldBackgroundColor: const Color(0xFF121212),
+            appBarTheme: const AppBarTheme(
+              backgroundColor: Color(0xFF121212),
+              elevation: 0,
+              centerTitle: true,
+              titleTextStyle: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold),
+              iconTheme: IconThemeData(color: Colors.white),
+            ),
+            cardColor: const Color(0xFF1E1E1E),
+          ),
+          home: const SplashScreen(),
+        );
+      },
     );
   }
 }
@@ -190,24 +297,40 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _startApp() async {
-    // Wait for splash screen time
-    await Future.delayed(const Duration(seconds: 5));
+    // 1. Initialize core services while showing splash
+    try {
+      if (Firebase.apps.isEmpty) {
+        await Firebase.initializeApp();
+      }
+      await _loadStoredUploads();
+    } catch (e) {
+      debugPrint("Init error: $e");
+    }
+
+    // Minimized wait time for branding
+    await Future.delayed(const Duration(milliseconds: 800));
     
     if (mounted) {
       try {
-        // Ensure Firebase is initialized before checking user
-        if (Firebase.apps.isEmpty) {
-          await Firebase.initializeApp();
-        }
-        
-        if (!mounted) return;
-
         final user = FirebaseAuth.instance.currentUser;
         if (user != null) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => const MainNavigationWrapper()),
-          );
+          // Attempt biometric authentication
+          bool isAuthenticated = await authenticateUser(context);
+          if (isAuthenticated && mounted) {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(builder: (context) => const MainNavigationWrapper()),
+            );
+          } else if (!isAuthenticated && mounted) {
+            // Fallback to manual login if biometric/PIN fails
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text("Authentication required. Please log in manually.")),
+            );
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(builder: (context) => const LoginView()),
+            );
+          }
         } else {
           Navigator.pushReplacement(
             context,
@@ -215,7 +338,7 @@ class _SplashScreenState extends State<SplashScreen> {
           );
         }
       } catch (e) {
-        // If Firebase fails, still go to SignUp/Login so user can see something
+        // If error, still go to SignUp/Login so user can see something
         debugPrint("Splash Screen error: $e");
         if (mounted) {
           Navigator.pushReplacement(
@@ -229,8 +352,9 @@ class _SplashScreenState extends State<SplashScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
-      backgroundColor: const Color(0xFFF3EDFF),
+      backgroundColor: isDark ? const Color(0xFF121212) : const Color(0xFFF3EDFF),
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -246,48 +370,48 @@ class _SplashScreenState extends State<SplashScreen> {
                       height: 140,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        border: Border.all(color: const Color(0xFF4F378A), width: 4),
+                        border: Border.all(color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A), width: 4),
                       ),
                     ),
-                    const Icon(Icons.school, size: 70, color: Color(0xFF4F378A)),
+                    Icon(Icons.school, size: 70, color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A)),
                     Positioned(
                       bottom: 10,
                       right: 15,
                       child: Container(
                         padding: const EdgeInsets.all(4),
-                        decoration: const BoxDecoration(
-                          color: Color(0xFF4F378A),
+                        decoration: BoxDecoration(
+                          color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A),
                           shape: BoxShape.circle,
                         ),
-                        child: const Icon(Icons.check, size: 14, color: Colors.white),
+                        child: Icon(Icons.check, size: 14, color: isDark ? Colors.black : Colors.white),
                       ),
                     )
                   ],
                 ),
                 const SizedBox(height: 24),
-                const Text(
-                  "iSKOLAR",
+                Text(
+                  "ISKOLAR",
                   style: TextStyle(
                     fontSize: 40,
                     fontWeight: FontWeight.w900,
                     letterSpacing: 2,
-                    color: Color(0xFF342361),
+                    color: isDark ? Colors.white : const Color(0xFF342361),
                   ),
                 ),
-                const Text(
+                Text(
                   "— GRANT —",
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
                     letterSpacing: 6,
-                    color: Color(0xFF4F378A),
+                    color: isDark ? Colors.white70 : const Color(0xFF4F378A),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 100),
-            const CircularProgressIndicator(
-              color: Color(0xFF4F378A),
+            CircularProgressIndicator(
+              color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A),
               strokeWidth: 4,
             ),
           ],
@@ -378,9 +502,21 @@ class _LoginViewState extends State<LoginView> {
       );
 
       if (mounted) {
-        navigator.pushReplacement(
-          MaterialPageRoute(builder: (context) => const MainNavigationWrapper()),
-        );
+        // Authenticate with biometric after successful Firebase login if enabled
+        bool isAuthenticated = await authenticateUser(context);
+        if (isAuthenticated && mounted) {
+          navigator.pushReplacement(
+            MaterialPageRoute(builder: (context) => const MainNavigationWrapper()),
+          );
+        } else if (!isAuthenticated && mounted) {
+          // If biometric fails after password login, still allow entry but notify
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Biometric verification skipped.")),
+          );
+          navigator.pushReplacement(
+            MaterialPageRoute(builder: (context) => const MainNavigationWrapper()),
+          );
+        }
       }
     } on FirebaseAuthException catch (e) {
       String message = "Login failed";
@@ -412,8 +548,9 @@ class _LoginViewState extends State<LoginView> {
 
   @override
   Widget build(BuildContext context) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
-      backgroundColor: Colors.white,
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       body: SingleChildScrollView(
         child: Column(
           children: [
@@ -421,15 +558,15 @@ class _LoginViewState extends State<LoginView> {
             Container(
               width: double.infinity,
               height: 300,
-              decoration: const BoxDecoration(
-                color: Color(0xFFF3EDFF),
-                borderRadius: BorderRadius.only(
+              decoration: BoxDecoration(
+                color: isDark ? Colors.white.withValues(alpha: 0.05) : const Color(0xFFF3EDFF),
+                borderRadius: const BorderRadius.only(
                   bottomLeft: Radius.circular(40),
                   bottomRight: Radius.circular(40),
                 ),
               ),
-              child: const Center(
-                child: Icon(Icons.person_pin, size: 180, color: Color(0xFF4F378A)),
+              child: Center(
+                child: Icon(Icons.person_pin, size: 180, color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A)),
               ),
             ),
 
@@ -438,13 +575,13 @@ class _LoginViewState extends State<LoginView> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
+                  Text(
                     "Welcome Back!",
-                    style: TextStyle(fontSize: 30, fontWeight: FontWeight.bold, color: Color(0xFF342361)),
+                    style: TextStyle(fontSize: 30, fontWeight: FontWeight.bold, color: isDark ? Colors.white : const Color(0xFF342361)),
                   ),
-                  const Text(
+                  Text(
                     "Log in to your account",
-                    style: TextStyle(color: Colors.black54, fontSize: 14),
+                    style: TextStyle(color: isDark ? Colors.white70 : Colors.black54, fontSize: 14),
                   ),
                   const SizedBox(height: 32),
 
@@ -455,8 +592,8 @@ class _LoginViewState extends State<LoginView> {
                         child: ElevatedButton(
                           onPressed: () => setState(() => _isStudentLogin = true),
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: _isStudentLogin ? const Color(0xFF4F378A) : const Color(0xFFF3EDFF),
-                            foregroundColor: _isStudentLogin ? Colors.white : const Color(0xFF4F378A),
+                            backgroundColor: _isStudentLogin ? const Color(0xFF4F378A) : (isDark ? Colors.white10 : const Color(0xFFF3EDFF)),
+                            foregroundColor: _isStudentLogin ? Colors.white : (isDark ? Colors.white70 : const Color(0xFF4F378A)),
                             elevation: 0,
                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                             padding: const EdgeInsets.symmetric(vertical: 16),
@@ -469,8 +606,8 @@ class _LoginViewState extends State<LoginView> {
                         child: ElevatedButton(
                           onPressed: () => setState(() => _isStudentLogin = false),
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: !_isStudentLogin ? const Color(0xFF4F378A) : const Color(0xFFF3EDFF),
-                            foregroundColor: !_isStudentLogin ? Colors.white : const Color(0xFF4F378A),
+                            backgroundColor: !_isStudentLogin ? const Color(0xFF4F378A) : (isDark ? Colors.white10 : const Color(0xFFF3EDFF)),
+                            foregroundColor: !_isStudentLogin ? Colors.white : (isDark ? Colors.white70 : const Color(0xFF4F378A)),
                             elevation: 0,
                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                             padding: const EdgeInsets.symmetric(vertical: 16),
@@ -510,9 +647,9 @@ class _LoginViewState extends State<LoginView> {
                     alignment: Alignment.centerLeft,
                     child: TextButton(
                       onPressed: () {},
-                      child: const Text(
+                      child: Text(
                         "Forgot password?",
-                        style: TextStyle(color: Color(0xFF4F378A), fontWeight: FontWeight.bold),
+                        style: TextStyle(color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A), fontWeight: FontWeight.bold),
                       ),
                     ),
                   ),
@@ -539,7 +676,7 @@ class _LoginViewState extends State<LoginView> {
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        const Text("Don't have an account? ", style: TextStyle(color: Colors.black54)),
+                        Text("Don't have an account? ", style: TextStyle(color: isDark ? Colors.white54 : Colors.black54)),
                         GestureDetector(
                           onTap: () {
                             Navigator.push(
@@ -547,9 +684,9 @@ class _LoginViewState extends State<LoginView> {
                               MaterialPageRoute(builder: (context) => const SignUpView()),
                             );
                           },
-                          child: const Text(
+                          child: Text(
                             "Sign up",
-                            style: TextStyle(color: Color(0xFF4F378A), fontWeight: FontWeight.bold),
+                            style: TextStyle(color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A), fontWeight: FontWeight.bold),
                           ),
                         ),
                       ],
@@ -573,10 +710,11 @@ class _LoginViewState extends State<LoginView> {
     bool obscureText = false,
     VoidCallback? onToggleVisibility,
   }) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF1A1A1A))),
+        Text(label, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: isDark ? Colors.white : const Color(0xFF1A1A1A))),
         const SizedBox(height: 12),
         TextField(
           controller: controller,
@@ -584,22 +722,22 @@ class _LoginViewState extends State<LoginView> {
           style: const TextStyle(fontSize: 16),
           decoration: InputDecoration(
             hintText: hint,
-            hintStyle: const TextStyle(color: Colors.black26, fontSize: 16),
+            hintStyle: TextStyle(color: isDark ? Colors.white24 : Colors.black26, fontSize: 16),
             prefixIcon: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Icon(icon, color: Colors.black38, size: 24),
+              child: Icon(icon, color: isDark ? Colors.white38 : Colors.black38, size: 24),
             ),
             suffixIcon: isPassword
               ? Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: IconButton(
-                    icon: Icon(obscureText ? Icons.visibility_off : Icons.visibility, color: const Color(0xFF342361), size: 24),
+                    icon: Icon(obscureText ? Icons.visibility_off : Icons.visibility, color: isDark ? Colors.white70 : const Color(0xFF342361), size: 24),
                     onPressed: onToggleVisibility,
                   ),
                 )
               : null,
             filled: true,
-            fillColor: const Color(0xFFF3EDFF).withValues(alpha: 0.5),
+            fillColor: isDark ? Colors.white.withValues(alpha: 0.05) : const Color(0xFFF3EDFF).withValues(alpha: 0.5),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(20), borderSide: BorderSide.none),
             contentPadding: const EdgeInsets.symmetric(vertical: 22),
           ),
@@ -697,16 +835,21 @@ class _SignUpViewState extends State<SignUpView> {
 
   @override
   Widget build(BuildContext context) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(backgroundColor: Colors.white, elevation: 0, iconTheme: const IconThemeData(color: Color(0xFF342361))),
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent, 
+        elevation: 0, 
+        iconTheme: IconThemeData(color: isDark ? Colors.white : const Color(0xFF342361))
+      ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.symmetric(horizontal: 32),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Create Account", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Color(0xFF342361))),
-            const Text("Join the iSKOLAR community", style: TextStyle(color: Colors.black54, fontSize: 16)),
+            Text("Create Account", style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: isDark ? Colors.white : const Color(0xFF342361))),
+            Text("Join the ISKOLAR community", style: TextStyle(color: isDark ? Colors.white70 : Colors.black54, fontSize: 16)),
             const SizedBox(height: 40),
 
             _buildInputField(label: "Full Name", hint: "Enter your full name", icon: Icons.person_outline, controller: _nameController),
@@ -772,12 +915,12 @@ class _SignUpViewState extends State<SignUpView> {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Text("Already have an account? ", style: TextStyle(color: Colors.black54)),
+                  Text("Already have an account? ", style: TextStyle(color: isDark ? Colors.white54 : Colors.black54)),
                   GestureDetector(
                     onTap: _handleLogin,
-                    child: const Text(
+                    child: Text(
                       "Login",
-                      style: TextStyle(color: Color(0xFF4F378A), fontWeight: FontWeight.bold),
+                      style: TextStyle(color: isDark ? const Color(0xFFBB86FC) : const Color(0xFF4F378A), fontWeight: FontWeight.bold),
                     ),
                   ),
                 ],
@@ -796,15 +939,16 @@ class _SignUpViewState extends State<SignUpView> {
     required List<String> items,
     required ValueChanged<String?> onChanged,
   }) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF1A1A1A))),
+        Text(label, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: isDark ? Colors.white : const Color(0xFF1A1A1A))),
         const SizedBox(height: 12),
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           decoration: BoxDecoration(
-            color: const Color(0xFFF3EDFF).withValues(alpha: 0.5),
+            color: isDark ? Colors.white.withValues(alpha: 0.05) : const Color(0xFFF3EDFF).withValues(alpha: 0.5),
             borderRadius: BorderRadius.circular(20),
           ),
           child: DropdownButtonHideUnderline(
@@ -812,7 +956,8 @@ class _SignUpViewState extends State<SignUpView> {
               value: value,
               isExpanded: true,
               icon: const Icon(Icons.keyboard_arrow_down, color: Color(0xFF342361)),
-              style: const TextStyle(color: Colors.black87, fontSize: 16),
+              dropdownColor: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+              style: TextStyle(color: isDark ? Colors.white : Colors.black87, fontSize: 16),
               items: items.map((String item) {
                 return DropdownMenuItem<String>(
                   value: item,
@@ -836,10 +981,11 @@ class _SignUpViewState extends State<SignUpView> {
     bool obscureText = false,
     VoidCallback? onToggleVisibility,
   }) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF1A1A1A))),
+        Text(label, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: isDark ? Colors.white : const Color(0xFF1A1A1A))),
         const SizedBox(height: 12),
         TextField(
           controller: controller,
@@ -847,22 +993,22 @@ class _SignUpViewState extends State<SignUpView> {
           style: const TextStyle(fontSize: 16),
           decoration: InputDecoration(
             hintText: hint,
-            hintStyle: const TextStyle(color: Colors.black26, fontSize: 16),
+            hintStyle: TextStyle(color: isDark ? Colors.white24 : Colors.black26, fontSize: 16),
             prefixIcon: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Icon(icon, color: Colors.black38, size: 24),
+              child: Icon(icon, color: isDark ? Colors.white38 : Colors.black38, size: 24),
             ),
             suffixIcon: isPassword
               ? Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: IconButton(
-                    icon: Icon(obscureText ? Icons.visibility_off : Icons.visibility, color: const Color(0xFF342361), size: 24),
+                    icon: Icon(obscureText ? Icons.visibility_off : Icons.visibility, color: isDark ? Colors.white70 : const Color(0xFF342361), size: 24),
                     onPressed: onToggleVisibility,
                   ),
                 )
               : null,
             filled: true,
-            fillColor: const Color(0xFFF3EDFF).withValues(alpha: 0.5),
+            fillColor: isDark ? Colors.white.withValues(alpha: 0.05) : const Color(0xFFF3EDFF).withValues(alpha: 0.5),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(20), borderSide: BorderSide.none),
             contentPadding: const EdgeInsets.symmetric(vertical: 22),
           ),
@@ -894,7 +1040,6 @@ class _MainNavigationWrapperState extends State<MainNavigationWrapper> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      drawer: _selectedIndex == 0 ? const DocumentChecklistDrawer() : null,
       body: IndexedStack(
         index: _selectedIndex,
         children: _screens,
@@ -932,6 +1077,86 @@ class HomeView extends StatefulWidget {
 class _HomeViewState extends State<HomeView> {
   bool _isIncomingFirstYear = true;
   bool _showAllJobs = false;
+  bool _showAllFeatured = false;
+
+  void _showProgressModal(Map<String, dynamic>? data, bool isRenewal) {
+    String grantName = data?['active_grant'] ?? (isRenewal ? "Skolar ng Taytay" : "Application");
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => Container(
+        height: MediaQuery.of(context).size.height * 0.7,
+        padding: const EdgeInsets.all(24),
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.only(topLeft: Radius.circular(30), topRight: Radius.circular(30)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(child: Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2)))),
+            const SizedBox(height: 24),
+            Text(isRenewal ? "Renewal: $grantName" : "Progress: $grantName", style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF342361))),
+            const Text("Track your current scholarship status", style: TextStyle(color: Colors.grey)),
+            const SizedBox(height: 32),
+            if (isRenewal) ...[
+              _buildProgressStep("Stage 1: Document Submission", "Completed", true, true),
+              _buildProgressStep("Stage 2: Academic Validation", "Completed", true, true),
+              _buildProgressStep("Stage 3: Verification of Grades", "In Progress", true, false),
+              _buildProgressStep("Stage 4: Fund Release", "Pending", false, false),
+            ] else ...[
+              _buildProgressStep("Stage 1: Initial Review", "Completed", true, true),
+              _buildProgressStep("Stage 2: Document Verification", "Pending", false, true),
+              _buildProgressStep("Stage 3: Examination Schedule", "Pending", false, true),
+              _buildProgressStep("Stage 4: Final Approval", "Pending", false, false),
+            ],
+            const Spacer(),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF4F378A),
+                minimumSize: const Size(double.infinity, 55),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              ),
+              child: const Text("Close", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProgressStep(String title, String status, bool isDone, bool showLine) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Column(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(4),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: isDone ? Colors.green : (status == "In Progress" ? const Color(0xFF4F378A) : Colors.grey[200]),
+              ),
+              child: Icon(isDone ? Icons.check : (status == "In Progress" ? Icons.refresh : Icons.circle), size: 16, color: isDone || status == "In Progress" ? Colors.white : Colors.grey),
+            ),
+            if (showLine) Container(width: 2, height: 40, color: isDone ? Colors.green : Colors.grey[200]),
+          ],
+        ),
+        const SizedBox(width: 16),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: status == "Pending" ? Colors.grey : const Color(0xFF342361))),
+            Text(status, style: TextStyle(fontSize: 12, color: isDone ? Colors.green : (status == "In Progress" ? const Color(0xFF4F378A) : Colors.grey))),
+          ],
+        ),
+      ],
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -947,93 +1172,205 @@ class _HomeViewState extends State<HomeView> {
           var data = snapshot.data!.data() as Map<String, dynamic>;
           name = data['full_name'] ?? "Scholar";
           scholarId = data['scholar_number'] ?? "";
-        }
+          bool isRenewal = data['applicant_type'] == "Renewal Applicant";
+          String activeGrant = data['active_grant'] ?? (isRenewal ? "Skolar ng Taytay" : "New Application");
 
-        return Scaffold(
-          appBar: AppBar(
-            title: const Text("Scholarship Hub"),
-            leading: Builder(builder: (context) {
-              return IconButton(
-                icon: const Icon(Icons.fact_check_outlined),
-                onPressed: () => Scaffold.of(context).openDrawer(),
-              );
-            }),
-            actions: [
-              IconButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (context) => const NotificationsListView()),
-                  );
-                },
-                icon: Stack(
-                  children: [
-                    const Icon(Icons.notifications_none),
-                    if (globalNotifications.any((n) => !n.isRead))
-                      Positioned(
-                        right: 0,
-                        top: 0,
-                        child: Container(
-                          padding: const EdgeInsets.all(5),
-                          decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                          constraints: const BoxConstraints(minWidth: 8, minHeight: 8),
-                        ),
-                      )
-                  ],
-                ),
-              ),
-              const Padding(
-                padding: EdgeInsets.only(right: 16.0),
-                child: CircleAvatar(radius: 18, backgroundColor: Color(0xFF4F378A), child: Icon(Icons.person, color: Colors.white, size: 20)),
-              )
-            ],
-          ),
-          body: ListView(
-            padding: const EdgeInsets.all(20),
-            children: [
-              Text("Welcome back, $name!", style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF342361))),
-              Text("Scholarship ID: $scholarId", style: const TextStyle(color: Colors.black54, fontSize: 13)),
-              const SizedBox(height: 30),
+          String firstName = name.split(' ')[0];
+          String? photoPath = data['profile_photo_path'];
 
-          // Application Status Card
-          const SectionHeader(title: "Current Application"),
-          const SizedBox(height: 12),
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: const Color(0xFFCBBEE4).withValues(alpha: 0.3),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: const Color(0xFF4F378A).withValues(alpha: 0.1)),
-            ),
-            child: Row(
-              children: [
-                const Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    SizedBox(
-                      width: 50,
-                      height: 50,
-                      child: CircularProgressIndicator(value: 0.75, strokeWidth: 6, color: Color(0xFF482F7D), backgroundColor: Colors.white),
-                    ),
-                    Text("3/4", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                  ],
-                ),
-                const SizedBox(width: 20),
-                const Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+          return Scaffold(
+            drawer: const DocumentChecklistDrawer(),
+            appBar: AppBar(
+              title: const Text("ISKOLAR"),
+              leading: Builder(builder: (context) {
+                return IconButton(
+                  icon: const Icon(Icons.assignment_outlined, color: Color(0xFF4F378A)),
+                  onPressed: () => Scaffold.of(context).openDrawer(),
+                  tooltip: "Preparation Checklist",
+                );
+              }),
+              actions: [
+                IconButton(
+                  tooltip: "Notifications",
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => const NotificationsListView()),
+                    );
+                  },
+                  icon: Stack(
                     children: [
-                      Text("Renewal Processing", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                      Text("Verification of Grades (Stage 3)", style: TextStyle(color: Colors.black54, fontSize: 12)),
+                      const Icon(Icons.notifications_none),
+                      if (globalNotifications.any((n) => !n.isRead))
+                        Positioned(
+                          right: 0,
+                          top: 0,
+                          child: Container(
+                            padding: const EdgeInsets.all(5),
+                            decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                            constraints: const BoxConstraints(minWidth: 8, minHeight: 8),
+                          ),
+                        )
                     ],
                   ),
                 ),
-                const Icon(Icons.chevron_right, color: Color(0xFF4F378A)),
+                Padding(
+                  padding: const EdgeInsets.only(right: 16.0),
+                  child: GestureDetector(
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (context) => const SettingsView()),
+                      );
+                    },
+                    child: CircleAvatar(
+                      radius: 18,
+                      backgroundColor: const Color(0xFF4F378A),
+                      backgroundImage: photoPath != null ? FileImage(File(photoPath)) : null,
+                      child: photoPath == null ? const Icon(Icons.person, color: Colors.white, size: 20) : null,
+                    ),
+                  ),
+                )
               ],
             ),
-          ),
+            body: ListView(
+              padding: const EdgeInsets.all(20),
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).cardColor,
+                    borderRadius: BorderRadius.circular(28),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: Theme.of(context).brightness == Brightness.dark ? 0.2 : 0.08),
+                        blurRadius: 20,
+                        offset: const Offset(0, 10),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text("Hello, $firstName! 👋", 
+                                  style: TextStyle(
+                                    fontSize: 28, 
+                                    fontWeight: FontWeight.bold, 
+                                    color: Theme.of(context).brightness == Brightness.dark 
+                                        ? Colors.white 
+                                        : const Color(0xFF342361)
+                                  )
+                                ),
+                                const SizedBox(height: 4),
+                                Text("Ready to reach your dreams today?", 
+                                  style: TextStyle(
+                                    color: Theme.of(context).brightness == Brightness.dark 
+                                        ? Colors.white70 
+                                        : Colors.black54, 
+                                    fontSize: 14, 
+                                    fontWeight: FontWeight.w500
+                                  )
+                                ),
+                              ],
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: const BoxDecoration(
+                              color: Color(0xFFF3EDFF),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(Icons.auto_awesome, color: Color(0xFF4F378A), size: 28),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 20),
+                      const Divider(height: 1, color: Color(0xFFF3EDFF)),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Icon(Icons.badge_outlined, size: 14, color: Theme.of(context).brightness == Brightness.dark ? Colors.white24 : Colors.black26),
+                          const SizedBox(width: 8),
+                          Text("Scholarship ID: $scholarId", 
+                            style: TextStyle(
+                              color: Theme.of(context).brightness == Brightness.dark ? Colors.white38 : Colors.black38, 
+                              fontSize: 12, 
+                              letterSpacing: 0.5
+                            )
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 30),
 
-          const SizedBox(height: 30),
+                // Application Status Card (Different for Renewal vs New)
+                SectionHeader(title: isRenewal ? "Renewal Status" : "Current Application"),
+                const SizedBox(height: 12),
+                GestureDetector(
+                  onTap: () => _showProgressModal(data, isRenewal),
+                  child: Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: isRenewal 
+                          ? (Theme.of(context).brightness == Brightness.dark ? Colors.green.withValues(alpha: 0.2) : const Color(0xFFE8F5E9))
+                          : (Theme.of(context).brightness == Brightness.dark ? const Color(0xFF4F378A).withValues(alpha: 0.2) : const Color(0xFFCBBEE4).withValues(alpha: 0.3)),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: isRenewal ? Colors.green.withValues(alpha: 0.3) : const Color(0xFF4F378A).withValues(alpha: 0.1)),
+                    ),
+                    child: Row(
+                      children: [
+                        Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            SizedBox(
+                              width: 50,
+                              height: 50,
+                              child: CircularProgressIndicator(
+                                value: isRenewal ? 0.75 : 0.25, 
+                                strokeWidth: 6, 
+                                color: isRenewal ? Colors.green : const Color(0xFF482F7D), 
+                                backgroundColor: Theme.of(context).brightness == Brightness.dark ? Colors.white12 : Colors.white,
+                              ),
+                            ),
+                            Text(isRenewal ? "3/4" : "1/4", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                          ],
+                        ),
+                        const SizedBox(width: 20),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(isRenewal ? "Renewal: $activeGrant" : activeGrant, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                              Text(isRenewal ? "Verification of Grades (Stage 3)" : "Initial Review (Stage 1)", style: TextStyle(color: Theme.of(context).brightness == Brightness.dark ? Colors.white70 : Colors.black54, fontSize: 12)),
+                            ],
+                          ),
+                        ),
+                        const Icon(Icons.chevron_right, color: Color(0xFF4F378A)),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 30),
+
+                if (isRenewal) ...[
+                  // Renewal-specific Dashboard section
+                  const SectionHeader(title: "Maintenance Tracker"),
+                  const SizedBox(height: 12),
+                  _buildMaintenanceCard("GWA Requirement", "Minimum 2.25", "Your current GWA: 1.75", Colors.green, Icons.trending_up),
+                  const SizedBox(height: 12),
+                  _buildMaintenanceCard("Required Units", "21 Units", "Completed: 21 Units", Colors.blue, Icons.auto_stories),
+                  const SizedBox(height: 30),
+                ],
 
           // Eligibility Filter
           Row(
@@ -1057,76 +1394,35 @@ class _HomeViewState extends State<HomeView> {
           const SizedBox(height: 24),
 
           // Featured Section
-          const SectionHeader(title: "Featured Grants"),
-          const SizedBox(height: 12),
-          SizedBox(
-            height: 220,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              children: [
-                // 1. Bagong Pilipinas Merit (From image)
-                _buildFeaturedCard(
-                  "Bagong Pilipinas Merit",
-                  "Incoming 1st Year | GWA 95%",
-                  "Up to ₱120,000 / Year",
-                  const Color(0xFF1A237E), // Deep Blue
-                ),
-                // 2. CHED Merit (From image)
-                _buildFeaturedCard(
-                  "CHED Merit Program",
-                  "1st Year | GWA 93%+",
-                  "Up to ₱120,000 / Year",
-                  const Color(0xFFC62828), // Red
-                ),
-                // 3. CHED COSCHO (From image)
-                _buildFeaturedCard(
-                  "CHED COSCHO",
-                  "Incoming & Current | GWA 80%",
-                  "₱80,000 - ₱115,000 / AY",
-                  const Color(0xFF2E7D32), // Green
-                ),
-                // 4. ACEF-GIAHEP (From image)
-                _buildFeaturedCard(
-                  "ACEF-GIAHEP",
-                  "Priority Programs",
-                  "₱40,000 - ₱60,000 / Year",
-                  const Color(0xFFEF6C00), // Orange
-                ),
-                // 5. UNIFEST-TES (From image)
-                _buildFeaturedCard(
-                  "CHED UNIFEST-TES",
-                  "Ongoing Undergrads",
-                  "₱20,000 - ₱27,000 / Year",
-                  const Color(0xFF6A1B9A), // Purple
-                ),
-                
-                // Keep the database items as well
-                StreamBuilder<QuerySnapshot>(
-                  stream: FirebaseFirestore.instance.collection('grants').snapshots(),
-                  builder: (context, snapshot) {
-                    if (!snapshot.hasData) return const SizedBox();
-                    var docs = snapshot.data!.docs;
-                    return Row(
-                      children: docs.map((doc) {
-                        var data = doc.data() as Map<String, dynamic>;
-                        return _buildFeaturedCard(
-                          data['title'] ?? "Scholarship",
-                          data['slots'] ?? "Ongoing",
-                          data['benefit'] ?? "Financial Aid",
-                          Color(int.parse(data['color'] ?? "0xFF4F378A")),
-                        );
-                      }).toList(),
-                    );
-                  },
-                ),
-              ],
-            ),
+          SectionHeader(
+            title: "Featured Taytay Grants",
+            onSeeAll: () => setState(() => _showAllFeatured = !_showAllFeatured),
           ),
+          const SizedBox(height: 12),
+          if (!_showAllFeatured)
+            SizedBox(
+              height: 180,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                physics: const BouncingScrollPhysics(),
+                children: _buildFeaturedContent(user),
+              ),
+            )
+          else
+            GridView.count(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              crossAxisCount: 2,
+              mainAxisSpacing: 16,
+              crossAxisSpacing: 16,
+              childAspectRatio: 0.85,
+              children: _buildFeaturedContent(user, isVertical: true),
+            ),
 
           const SizedBox(height: 30),
 
           // Announcements Section
-          const SectionHeader(title: "Application Updates"),
+          const SectionHeader(title: "ANNOUNCEMENTS"),
           const SizedBox(height: 12),
           SizedBox(
             height: 160,
@@ -1137,37 +1433,24 @@ class _HomeViewState extends State<HomeView> {
                   .orderBy('timestamp', descending: true)
                   .snapshots(),
               builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
+                List<Widget> cards = [];
 
-                if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-                  return ListView(
-                    scrollDirection: Axis.horizontal,
-                    children: [
-                      _buildAnnouncementCard(
-                        context,
-                        "Welcome Scholar!",
-                        "Apply for your first scholarship to see real-time updates here.",
-                        "Today",
-                        const Color(0xFF4F378A),
-                      ),
-                      _buildAnnouncementCard(
-                        context,
-                        "CHED Alert",
-                        "CHED Merit applications for 2026 are now officially open.",
-                        "June 1, 2026",
-                        Colors.blue,
-                      ),
-                    ],
-                  );
-                }
+                // 1. Static Admin Announcement (Always Shown)
+                cards.add(
+                  _buildAnnouncementCard(
+                    context,
+                    "Office Notice",
+                    "The Scholarship Office will be closed on July 4th for a local holiday. Please submit pending docs early.",
+                    "Admin • Today",
+                    const Color(0xFF342361),
+                    "ADMIN",
+                  ),
+                );
 
-                return ListView.builder(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: snapshot.data!.docs.length,
-                  itemBuilder: (context, index) {
-                    var data = snapshot.data!.docs[index].data() as Map<String, dynamic>;
+                // 2. Personal Application Updates (Current Status)
+                if (snapshot.hasData && snapshot.data!.docs.isNotEmpty) {
+                  for (var doc in snapshot.data!.docs) {
+                    var data = doc.data() as Map<String, dynamic>;
                     String title = data['grant_title'] ?? "Scholarship";
                     String status = data['status'] ?? "PENDING";
                     Timestamp? ts = data['timestamp'] as Timestamp?;
@@ -1178,15 +1461,33 @@ class _HomeViewState extends State<HomeView> {
                     Color statusColor = status == "PENDING" ? Colors.amber : 
                                       status == "PASSED" ? Colors.green : Colors.red;
 
-                    return _buildAnnouncementCard(
-                      context,
-                      title,
-                      "Your application for $title is currently: $status",
-                      date,
-                      statusColor,
-                      "UPDATE",
+                    cards.add(
+                      _buildAnnouncementCard(
+                        context,
+                        "Status: $title",
+                        "Your application is currently: $status",
+                        "Update • $date",
+                        statusColor,
+                        "STATUS",
+                      ),
                     );
-                  },
+                  }
+                } else {
+                  // 3. Fallback News if no applications
+                  cards.add(
+                    _buildAnnouncementCard(
+                      context,
+                      "CHED Alert",
+                      "CHED Merit applications for 2026 are now officially open.",
+                      "June 1, 2026",
+                      Colors.blue,
+                    ),
+                  );
+                }
+
+                return ListView(
+                  scrollDirection: Axis.horizontal,
+                  children: cards,
                 );
               },
             ),
@@ -1217,64 +1518,163 @@ class _HomeViewState extends State<HomeView> {
         ],
       ),
     );
-  },
+  }
+  return const Center(child: CircularProgressIndicator());
+},
 );
   }
 
-  void _showEligibilityAlert(String title, bool forFirstYearOnly) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Row(
-          children: [
-            Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 28),
-            SizedBox(width: 10),
-            Text("Not Eligible", style: TextStyle(fontWeight: FontWeight.bold)),
-          ],
-        ),
-        content: Text("This '$title' grant is only available for ${forFirstYearOnly ? 'Incoming 1st Year Students' : 'Current College Students'}. Please check other available opportunities."),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("Close", style: TextStyle(color: Color(0xFF4F378A), fontWeight: FontWeight.bold)),
+  Widget _buildMaintenanceCard(String title, String req, String current, Color color, IconData icon) {
+    bool isDark = Theme.of(context).brightness == Brightness.dark;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withValues(alpha: 0.1)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: color.withValues(alpha: 0.1), shape: BoxShape.circle),
+            child: Icon(icon, color: color, size: 20),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                Text(req, style: TextStyle(color: isDark ? Colors.white60 : Colors.black54, fontSize: 11)),
+                const SizedBox(height: 4),
+                Text(current, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 12)),
+              ],
+            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildFeaturedCard(String title, String slots, String benefit, Color color) {
-    return Container(
-      width: 260,
-      margin: const EdgeInsets.only(right: 16),
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: color,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [BoxShadow(color: color.withValues(alpha: 0.2), blurRadius: 10, offset: const Offset(0, 4))],
+  List<Widget> _buildFeaturedContent(User? user, {bool isVertical = false}) {
+    List<Widget> allCards = [
+      _buildFeaturedCard(
+        "Iskolar ng Bayan",
+        "CHED | SHS Graduates",
+        "Free Tuition + Admission",
+        const Color(0xFF1A237E),
+        isVertical: isVertical,
+        isFirstYear: true,
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 4),
-          Text(slots, style: const TextStyle(color: Colors.white70, fontSize: 11)),
-          const Spacer(),
-          Text(benefit, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 12),
-          ElevatedButton(
-            onPressed: () {
-              // Corrected eligibility logic to match card descriptions
-              bool isMerit = title.contains("Merit");
-              
-              if (isMerit && !_isIncomingFirstYear) {
-                // Merit is for 1st Years only
-                _showEligibilityAlert(title, true);
-              } else if (title.contains("UNIFEST") && _isIncomingFirstYear) {
-                // TES/UNIFEST is usually for ongoing students
-                _showEligibilityAlert(title, false);
-              } else {
+      _buildFeaturedCard(
+        "Iskolar ni Gob",
+        "Rizal | Residente 3+ yrs",
+        "₱5,000 / Semester",
+        const Color(0xFFC62828),
+        isVertical: isVertical,
+        isFirstYear: false,
+      ),
+      _buildFeaturedCard(
+        "Iskolar ni Juan",
+        "DSWD | Tech-voc",
+        "Free Tuition + Allowance",
+        const Color(0xFF2E7D32),
+        isVertical: isVertical,
+        isFirstYear: true,
+      ),
+      _buildFeaturedCard(
+        "Iskolar ng Dolores",
+        "Brgy. Dolores | College",
+        "Educational Assistance",
+        const Color(0xFFEF6C00),
+        isVertical: isVertical,
+        isFirstYear: false,
+      ),
+      _buildFeaturedCard(
+        "Sta. Ana Skolar",
+        "Brgy. Sta. Ana | College",
+        "Financial Aid per Sem",
+        const Color(0xFF6A1B9A),
+        isVertical: isVertical,
+        isFirstYear: false,
+      ),
+      _buildFeaturedCard(
+        "Skolar ng Muzon",
+        "Brgy. Muzon | College",
+        "Financial Aid per Sem",
+        const Color(0xFF00838F),
+        isVertical: isVertical,
+        isFirstYear: false,
+      ),
+      _buildFeaturedCard(
+        "Skolar ng Taytay",
+        "LGU Taytay | Residents",
+        "Financial Aid per Sem",
+        const Color(0xFF4F378A),
+        isVertical: isVertical,
+        isFirstYear: null, // Both
+      ),
+    ];
+
+    return allCards.where((card) {
+      // Logic to filter based on toggle
+      final bool? grantIsFirstYear = (card as _FeaturedCardWrapper).isFirstYear;
+      if (grantIsFirstYear == null) return true; // Show for both
+      return grantIsFirstYear == _isIncomingFirstYear;
+    }).toList();
+  }
+
+  Widget _buildFeaturedCard(String title, String slots, String benefit, Color color, {bool isVertical = false, bool? isFirstYear}) {
+    return _FeaturedCardWrapper(
+      isFirstYear: isFirstYear,
+      child: Container(
+        width: isVertical ? null : 240,
+        margin: EdgeInsets.only(right: isVertical ? 0 : 16),
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: [
+            BoxShadow(
+              color: color.withValues(alpha: 0.3),
+              blurRadius: 8,
+              offset: const Offset(0, 4),
+            )
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.bold,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              slots,
+              style: const TextStyle(color: Colors.white70, fontSize: 10),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const Spacer(),
+            Text(
+              benefit,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: () {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
@@ -1284,22 +1684,25 @@ class _HomeViewState extends State<HomeView> {
                     ),
                   ),
                 );
-              }
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.white,
-              foregroundColor: color,
-              minimumSize: const Size(double.infinity, 36),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.white.withValues(alpha: 0.9),
+                foregroundColor: color,
+                elevation: 0,
+                minimumSize: const Size(double.infinity, 36),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                padding: EdgeInsets.zero,
+              ),
+              child: const Text("Apply Now", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
             ),
-            child: const Text("Apply Now", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildGrantItem(String title, String target, String benefit, Color color, IconData icon) {
+    bool isDark = Theme.of(context).brightness == Brightness.dark;
     return GestureDetector(
       onTap: () {
         Navigator.push(
@@ -1316,9 +1719,9 @@ class _HomeViewState extends State<HomeView> {
         margin: const EdgeInsets.only(bottom: 12),
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: Colors.white,
+          color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: Colors.grey[200]!),
+          border: Border.all(color: isDark ? Colors.white10 : Colors.grey[200]!),
         ),
         child: Row(
           children: [
@@ -1333,7 +1736,7 @@ class _HomeViewState extends State<HomeView> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                  Text(target, style: const TextStyle(color: Colors.black54, fontSize: 11)),
+                  Text(target, style: TextStyle(color: isDark ? Colors.white60 : Colors.black54, fontSize: 11)),
                 ],
               ),
             ),
@@ -1345,6 +1748,7 @@ class _HomeViewState extends State<HomeView> {
   }
 
   Widget _buildAnnouncementCard(BuildContext context, String title, String desc, String date, Color color, [String tag = "NEWS"]) {
+    bool isDark = Theme.of(context).brightness == Brightness.dark;
     return GestureDetector(
       onTap: () {
         if (tag == "UPDATE") {
@@ -1373,7 +1777,7 @@ class _HomeViewState extends State<HomeView> {
         margin: const EdgeInsets.only(right: 16),
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.1),
+          color: isDark ? color.withValues(alpha: 0.2) : color.withValues(alpha: 0.1),
           borderRadius: BorderRadius.circular(20),
           border: Border.all(color: color.withValues(alpha: 0.2)),
         ),
@@ -1386,16 +1790,25 @@ class _HomeViewState extends State<HomeView> {
               child: Text(tag, style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
             ),
             const Spacer(),
-            Text(title, style: TextStyle(color: color.withValues(alpha: 0.8), fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(title, style: TextStyle(color: isDark ? Colors.white : color.withValues(alpha: 0.8), fontSize: 18, fontWeight: FontWeight.bold)),
             const SizedBox(height: 4),
-            Text(desc, style: const TextStyle(color: Colors.black54, fontSize: 12), maxLines: 2, overflow: TextOverflow.ellipsis),
+            Text(desc, style: TextStyle(color: isDark ? Colors.white70 : Colors.black54, fontSize: 12), maxLines: 2, overflow: TextOverflow.ellipsis),
             const Spacer(),
-            Text(date, style: const TextStyle(color: Colors.black38, fontSize: 10)),
+            Text(date, style: TextStyle(color: isDark ? Colors.white38 : Colors.black38, fontSize: 10)),
           ],
         ),
       ),
     );
   }
+}
+
+// Simple wrapper to carry metadata for filtering
+class _FeaturedCardWrapper extends StatelessWidget {
+  final bool? isFirstYear;
+  final Widget child;
+  const _FeaturedCardWrapper({required this.isFirstYear, required this.child});
+  @override
+  Widget build(BuildContext context) => child;
 }
 
 // --- 2. EXAM STATUS VIEW ---
@@ -1405,12 +1818,11 @@ class ExamStatusView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser;
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF8F7FF),
       appBar: AppBar(
         title: const Text("Exam Dashboard"),
-        backgroundColor: Colors.white,
         elevation: 0,
       ),
       body: StreamBuilder<DocumentSnapshot>(
@@ -1452,6 +1864,7 @@ class ExamStatusView extends StatelessWidget {
                 children: [
                   // 1. Exam Status Card
                   _buildDashboardCard(
+                    context: context,
                     title: "Exam Status",
                     icon: Icons.assignment_turned_in_outlined,
                     child: Column(
@@ -1463,13 +1876,13 @@ class ExamStatusView extends StatelessWidget {
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                               decoration: BoxDecoration(
-                                color: const Color(0xFFFFF8E1),
+                                color: isDark ? Colors.amber.withValues(alpha: 0.1) : const Color(0xFFFFF8E1),
                                 borderRadius: BorderRadius.circular(8),
                               ),
                               child: Text(
                                 status,
-                                style: const TextStyle(
-                                  color: Color(0xFFFBC02D),
+                                style: TextStyle(
+                                  color: isDark ? Colors.amber : const Color(0xFFFBC02D),
                                   fontWeight: FontWeight.bold,
                                   fontSize: 12,
                                 ),
@@ -1477,17 +1890,17 @@ class ExamStatusView extends StatelessWidget {
                             ),
                             Text(
                               examDate,
-                              style: const TextStyle(color: Colors.black38, fontSize: 12),
+                              style: TextStyle(color: isDark ? Colors.white38 : Colors.black38, fontSize: 12),
                             ),
                           ],
                         ),
                         const SizedBox(height: 16),
-                        const Text(
+                        Text(
                           "Scholarship Qualifying Exam",
                           style: TextStyle(
                             fontSize: 18,
                             fontWeight: FontWeight.bold,
-                            color: Color(0xFF342361),
+                            color: isDark ? Colors.white : const Color(0xFF342361),
                           ),
                         ),
                       ],
@@ -1496,19 +1909,21 @@ class ExamStatusView extends StatelessWidget {
 
                   // 2. Results Summary Card
                   _buildDashboardCard(
+                    context: context,
                     title: "Results Summary",
                     icon: Icons.bar_chart_outlined,
-                    child: const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 20),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 20),
                       child: Text(
                         "Results are not yet published.",
-                        style: TextStyle(color: Colors.black26, fontSize: 14),
+                        style: TextStyle(color: isDark ? Colors.white24 : Colors.black26, fontSize: 14),
                       ),
                     ),
                   ),
 
                   // 3. Exam Details & Location Card
                   _buildDashboardCard(
+                    context: context,
                     title: "Exam Details & Location",
                     icon: Icons.location_on_outlined,
                     child: Column(
@@ -1517,23 +1932,23 @@ class ExamStatusView extends StatelessWidget {
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            _buildDetailItem("Room", room),
-                            _buildDetailItem("Building", building),
-                            _buildDetailItem("Seat", seat),
-                            _buildDetailItem("Time", time),
+                            _buildDetailItem(context, "Room", room),
+                            _buildDetailItem(context, "Building", building),
+                            _buildDetailItem(context, "Seat", seat),
+                            _buildDetailItem(context, "Time", time),
                           ],
                         ),
                         const SizedBox(height: 20),
                         const Divider(),
                         const SizedBox(height: 16),
-                        const Text("Testing Center Address:", style: TextStyle(color: Colors.black26, fontSize: 11)),
+                        Text("Testing Center Address:", style: TextStyle(color: isDark ? Colors.white38 : Colors.black26, fontSize: 11)),
                         const SizedBox(height: 8),
                         Text(
                           address,
-                          style: const TextStyle(
+                          style: TextStyle(
                             fontWeight: FontWeight.bold,
                             fontSize: 14,
-                            color: Color(0xFF342361),
+                            color: isDark ? Colors.white : const Color(0xFF342361),
                           ),
                         ),
                         const SizedBox(height: 20),
@@ -1550,7 +1965,7 @@ class ExamStatusView extends StatelessWidget {
                             height: 150,
                             width: double.infinity,
                             decoration: BoxDecoration(
-                              color: const Color(0xFFF1F3F4), // Map background color
+                              color: isDark ? Colors.white12 : const Color(0xFFF1F3F4), // Map background color
                               borderRadius: BorderRadius.circular(16),
                               image: const DecorationImage(
                                 image: NetworkImage('https://maps.googleapis.com/maps/api/staticmap?center=ICCT+Colleges+Sumulong+Highway&zoom=15&size=600x300&markers=color:red%7CICCT+Colleges+Sumulong+Highway&key=YOUR_API_KEY'), 
@@ -1641,36 +2056,39 @@ class ExamStatusView extends StatelessWidget {
 
                   // 4. Scholar Information Card
                   _buildDashboardCard(
+                    context: context,
                     title: "Scholar Information",
                     icon: Icons.school_outlined,
                     child: Column(
                       children: [
-                        _buildInfoRow("Scholar No", scholarId),
+                        _buildInfoRow(context, "Scholar No", scholarId),
                         const SizedBox(height: 12),
-                        _buildInfoRow("Name", name.toLowerCase()),
+                        _buildInfoRow(context, "Name", name.toLowerCase()),
                         const SizedBox(height: 12),
-                        _buildInfoRow("Course", course),
+                        _buildInfoRow(context, "Course", course),
                       ],
                     ),
                   ),
 
                   // 5. Requirements Status Card
                   _buildDashboardCard(
+                    context: context,
                     title: "Requirements Status",
                     icon: Icons.description_outlined,
                     child: Column(
                       children: [
-                        _buildRequirementRow("Report Card", "Completed", Colors.green, Icons.check_circle),
+                        _buildDynamicRequirementRow(context, "Report Card", ["Grade 11 Report Card", "Grade 12 Report Card (1st Sem)", "Transcript of Records"]),
                         const SizedBox(height: 12),
-                        _buildRequirementRow("Birth Certificate", "Completed", Colors.green, Icons.check_circle),
+                        _buildDynamicRequirementRow(context, "Birth Certificate", ["PSA Birth Certificate"]),
                         const SizedBox(height: 12),
-                        _buildRequirementRow("Income Certificate", "Pending", Colors.orange, Icons.hourglass_empty),
+                        _buildDynamicRequirementRow(context, "Income Certificate", ["Certificate of Indigency"]),
                       ],
                     ),
                   ),
 
                   // 6. Scholarship Qualification Card
                   _buildDashboardCard(
+                    context: context,
                     title: "Scholarship Qualification",
                     icon: Icons.emoji_events_outlined,
                     child: Column(
@@ -1678,17 +2096,17 @@ class ExamStatusView extends StatelessWidget {
                       children: [
                         Row(
                           children: [
-                            const Text("Status:", style: TextStyle(color: Colors.black26, fontSize: 14)),
+                            Text("Status:", style: TextStyle(color: isDark ? Colors.white38 : Colors.black26, fontSize: 14)),
                             const SizedBox(width: 12),
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                               decoration: BoxDecoration(
-                                color: const Color(0xFFF3EDFF),
+                                color: isDark ? const Color(0xFF4F378A).withValues(alpha: 0.2) : const Color(0xFFF3EDFF),
                                 borderRadius: BorderRadius.circular(12),
                               ),
-                              child: const Text(
+                              child: Text(
                                 "Eligible for Scholarship",
-                                style: TextStyle(color: Color(0xFF342361), fontWeight: FontWeight.bold, fontSize: 12),
+                                style: TextStyle(color: isDark ? Colors.white : const Color(0xFF342361), fontWeight: FontWeight.bold, fontSize: 12),
                               ),
                             ),
                           ],
@@ -1696,14 +2114,14 @@ class ExamStatusView extends StatelessWidget {
                         const SizedBox(height: 16),
                         Row(
                           children: [
-                            const Icon(Icons.refresh, size: 18, color: Color(0xFF342361)),
+                            Icon(Icons.refresh, size: 18, color: isDark ? Colors.white70 : const Color(0xFF342361)),
                             const SizedBox(width: 8),
                             RichText(
-                              text: const TextSpan(
-                                style: TextStyle(color: Color(0xFF342361), fontSize: 14),
+                              text: TextSpan(
+                                style: TextStyle(color: isDark ? Colors.white70 : const Color(0xFF342361), fontSize: 14),
                                 children: [
-                                  TextSpan(text: "Next Step: ", style: TextStyle(fontWeight: FontWeight.bold)),
-                                  TextSpan(text: "For Final Interview"),
+                                  const TextSpan(text: "Next Step: ", style: TextStyle(fontWeight: FontWeight.bold)),
+                                  const TextSpan(text: "For Final Interview"),
                                 ],
                               ),
                             ),
@@ -1721,16 +2139,17 @@ class ExamStatusView extends StatelessWidget {
     );
   }
 
-  Widget _buildDashboardCard({required String title, required IconData icon, required Widget child}) {
+  Widget _buildDashboardCard({required BuildContext context, required String title, required IconData icon, required Widget child}) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Container(
       margin: const EdgeInsets.only(bottom: 20),
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.circular(24),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.03),
+            color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.03),
             blurRadius: 10,
             offset: const Offset(0, 4),
           ),
@@ -1741,14 +2160,14 @@ class ExamStatusView extends StatelessWidget {
         children: [
           Row(
             children: [
-              Icon(icon, size: 20, color: const Color(0xFF342361)),
+              Icon(icon, size: 20, color: isDark ? Colors.white70 : const Color(0xFF342361)),
               const SizedBox(width: 10),
               Text(
                 title,
-                style: const TextStyle(
+                style: TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: 16,
-                  color: Color(0xFF342361),
+                  color: isDark ? Colors.white : const Color(0xFF342361),
                 ),
               ),
             ],
@@ -1760,49 +2179,72 @@ class ExamStatusView extends StatelessWidget {
     );
   }
 
-  Widget _buildDetailItem(String label, String value) {
+  Widget _buildDetailItem(BuildContext context, String label, String value) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(color: Colors.black26, fontSize: 11)),
+        Text(label, style: TextStyle(color: isDark ? Colors.white38 : Colors.black26, fontSize: 11)),
         const SizedBox(height: 4),
         Text(
           value,
-          style: const TextStyle(
+          style: TextStyle(
             fontWeight: FontWeight.bold,
             fontSize: 15,
-            color: Color(0xFF342361),
+            color: isDark ? Colors.white70 : const Color(0xFF342361),
           ),
         ),
       ],
     );
   }
 
-  Widget _buildInfoRow(String label, String value) {
+  Widget _buildInfoRow(BuildContext context, String label, String value) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(label, style: const TextStyle(color: Colors.black26, fontSize: 14)),
+        Text(label, style: TextStyle(color: isDark ? Colors.white38 : Colors.black26, fontSize: 14)),
         Text(
           value,
-          style: const TextStyle(
+          style: TextStyle(
             fontWeight: FontWeight.bold,
             fontSize: 14,
-            color: Color(0xFF342361),
+            color: isDark ? Colors.white70 : const Color(0xFF342361),
           ),
         ),
       ],
     );
   }
 
-  Widget _buildRequirementRow(String label, String status, Color color, IconData icon) {
+  Widget _buildDynamicRequirementRow(BuildContext context, String label, List<String> vaultKeys) {
+    bool isUploaded = vaultKeys.any((key) => globalUploads.containsKey(key));
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    
     return Row(
       children: [
-        Icon(icon, size: 18, color: color),
+        Icon(
+          isUploaded ? Icons.check_circle : Icons.hourglass_empty,
+          size: 18,
+          color: isUploaded ? Colors.green : Colors.orange,
+        ),
         const SizedBox(width: 12),
-        Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF342361))),
+        Text(
+          label,
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 14,
+            color: isDark ? Colors.white70 : const Color(0xFF342361),
+          ),
+        ),
         const Spacer(),
-        Text(status, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 14)),
+        Text(
+          isUploaded ? "Completed" : "Pending",
+          style: TextStyle(
+            color: isUploaded ? Colors.green : Colors.orange,
+            fontWeight: FontWeight.bold,
+            fontSize: 14,
+          ),
+        ),
       ],
     );
   }
@@ -1817,9 +2259,6 @@ class RequirementsView extends StatefulWidget {
 }
 
 class _RequirementsViewState extends State<RequirementsView> {
-  // Track uploaded files
-  final Map<String, Map<String, dynamic>?> _uploadedFiles = {};
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1831,6 +2270,10 @@ class _RequirementsViewState extends State<RequirementsView> {
   }
 
   Widget _buildPersonalStorage() {
+    final recentUploads = globalUploads.entries.toList()
+      ..sort((a, b) => (b.value['timestamp'] as DateTime).compareTo(a.value['timestamp'] as DateTime));
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+
     return ListView(
       padding: const EdgeInsets.all(24),
       children: [
@@ -1841,16 +2284,16 @@ class _RequirementsViewState extends State<RequirementsView> {
             borderRadius: BorderRadius.circular(16),
             border: Border.all(color: const Color(0xFF4F378A).withValues(alpha: 0.1)),
           ),
-          child: const Row(
+          child: Row(
             children: [
-              Icon(Icons.cloud_done_outlined, color: Color(0xFF4F378A)),
-              SizedBox(width: 16),
+              const Icon(Icons.cloud_done_outlined, color: Color(0xFF4F378A)),
+              const SizedBox(width: 16),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text("Vault Security Active", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                    Text("Your personal documents are encrypted and stored safely.", style: TextStyle(fontSize: 12, color: Colors.black54)),
+                    const Text("Vault Security Active", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                    Text("Your personal documents are encrypted and stored safely.", style: TextStyle(fontSize: 12, color: isDark ? Colors.white70 : Colors.black54)),
                   ],
                 ),
               ),
@@ -1858,7 +2301,7 @@ class _RequirementsViewState extends State<RequirementsView> {
           ),
         ),
         const SizedBox(height: 30),
-        const Text("Folders", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Color(0xFF342361))),
+        Text("Folders", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : const Color(0xFF342361))),
         const SizedBox(height: 16),
         GridView.count(
           shrinkWrap: true,
@@ -1868,73 +2311,353 @@ class _RequirementsViewState extends State<RequirementsView> {
           crossAxisSpacing: 16,
           childAspectRatio: 1.5,
           children: [
-            _buildFolderCard("Certificates", "4 items", Colors.blue, Icons.workspace_premium),
-            _buildFolderCard("IDs", "2 items", Colors.orange, Icons.badge),
-            _buildFolderCard("Grades", "12 items", Colors.green, Icons.grade),
-            _buildFolderCard("Others", "0 items", Colors.grey, Icons.more_horiz),
+            _buildFolderCard(context, "Certificates", "${globalUploads.values.where((e) => e['folder'] == 'Certificates').length} items", Colors.blue, Icons.workspace_premium),
+            _buildFolderCard(context, "IDs", "${globalUploads.values.where((e) => e['folder'] == 'IDs').length} items", Colors.orange, Icons.badge),
+            _buildFolderCard(context, "Grades", "${globalUploads.values.where((e) => e['folder'] == 'Grades').length} items", Colors.green, Icons.grade),
+            _buildFolderCard(context, "Others", "${globalUploads.values.where((e) => e['folder'] == 'Others').length} items", Colors.grey, Icons.more_horiz),
           ],
         ),
         const SizedBox(height: 30),
-        const Text("Recent Uploads", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: Color(0xFF342361))),
+        Text("Recent Uploads", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : const Color(0xFF342361))),
         const SizedBox(height: 12),
-        _buildDocCard("My_Resumes_2026.pdf"),
-        _buildDocCard("Passport_Scan.jpg"),
+        if (recentUploads.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 20),
+            child: Center(child: Text("No files uploaded yet", style: TextStyle(color: Colors.grey))),
+          )
+        else
+          ...recentUploads.take(5).map((entry) => _buildDocCard(entry.key, entry.value)),
       ],
     );
   }
 
-  Widget _buildFolderCard(String name, String count, Color color, IconData icon) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: Colors.grey[100]!),
-        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.02), blurRadius: 10, offset: const Offset(0, 4))],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(icon, color: color, size: 28),
-          const Spacer(),
-          Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-          Text(count, style: const TextStyle(fontSize: 11, color: Colors.black38)),
-        ],
+  Widget _buildFolderCard(BuildContext context, String name, String count, Color color, IconData icon) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    return GestureDetector(
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (context) => FolderDetailView(folderName: name, color: color, icon: icon)),
+        ).then((_) => setState(() {})); // Refresh main view on back
+      },
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Theme.of(context).cardColor,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: isDark ? Colors.white10 : Colors.grey[100]!),
+          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.02), blurRadius: 10, offset: const Offset(0, 4))],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, color: color, size: 28),
+            const Spacer(),
+            Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+            Text(count, style: TextStyle(fontSize: 11, color: isDark ? Colors.white38 : Colors.black38)),
+          ],
+        ),
       ),
     );
   }
 
-
-  Widget _buildDocCard(String title) {
-    final file = _uploadedFiles[title];
+  Widget _buildDocCard(String title, Map<String, dynamic> file) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
       padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.grey[100]!)),
+      decoration: BoxDecoration(
+        color: Theme.of(context).cardColor, 
+        borderRadius: BorderRadius.circular(16), 
+        border: Border.all(color: isDark ? Colors.white10 : Colors.grey[100]!)
+      ),
       child: Row(
         children: [
-          Icon(file != null ? Icons.check_circle : Icons.description_outlined, color: file != null ? Colors.green : Colors.grey, size: 30),
+          const Icon(Icons.check_circle, color: Colors.green, size: 30),
           const SizedBox(width: 16),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-                Text(file != null ? file['name'] : "No file uploaded", style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                Text(file['name'], style: TextStyle(fontSize: 12, color: isDark ? Colors.white70 : Colors.black54)),
               ],
             ),
           ),
-          if (file == null)
-            TextButton(onPressed: () => _showUploadModal(title), child: const Text("Upload"))
-          else
-            IconButton(onPressed: () => setState(() => _uploadedFiles[title] = null), icon: const Icon(Icons.delete_outline, color: Colors.redAccent))
+          IconButton(
+            onPressed: () {
+              setState(() {
+                globalUploads.remove(title);
+                _saveUploadsToDisk();
+              });
+            }, 
+            icon: const Icon(Icons.delete_outline, color: Colors.redAccent)
+          )
+        ],
+      ),
+    );
+  }
+}
+
+class FolderDetailView extends StatefulWidget {
+  final String folderName;
+  final Color color;
+  final IconData icon;
+
+  const FolderDetailView({super.key, required this.folderName, required this.color, required this.icon});
+
+  @override
+  State<FolderDetailView> createState() => _FolderDetailViewState();
+}
+
+class _FolderDetailViewState extends State<FolderDetailView> {
+  // Mock data for required files per folder
+  final Map<String, List<String>> _requiredFiles = {
+    "Certificates": ["PSA Birth Certificate", "Certificate of Indigency", "Scholarship Certification"],
+    "IDs": ["School ID", "Government ID / Passport"],
+    "Grades": ["Grade 11 Report Card", "Grade 12 Report Card (1st Sem)", "Transcript of Records"],
+    "Others": ["Good Moral Certificate", "Barangay Clearance"],
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    List<String> requirements = _requiredFiles[widget.folderName] ?? ["General Document"];
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.folderName)),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          Row(
+            children: [
+              Icon(widget.icon, color: widget.color, size: 40),
+              const SizedBox(width: 16),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(widget.folderName, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                  Text("Securely Stored", style: TextStyle(color: isDark ? Colors.white38 : Colors.grey)),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 32),
+          Text("Files Needed", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : const Color(0xFF342361))),
+          const SizedBox(height: 16),
+          
+          ...requirements.map((req) => _buildRequirementItem(req, isCustom: false)),
+          
+          // Show items that are in globalUploads but NOT in the requirements list (Custom uploads)
+          ...globalUploads.entries
+              .where((e) => e.value['folder'] == widget.folderName && !requirements.contains(e.key))
+              .map((entry) => _buildRequirementItem(entry.key, isCustom: true)),
+          
+          const SizedBox(height: 30),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _showCustomUploadDialog(),
+        label: const Text("Upload New"),
+        icon: const Icon(Icons.add_a_photo_outlined),
+        backgroundColor: widget.color,
+        foregroundColor: Colors.white,
+      ),
+    );
+  }
+
+  void _showCustomUploadDialog() {
+    final TextEditingController nameController = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Name your file"),
+        content: TextField(
+          controller: nameController,
+          decoration: const InputDecoration(hintText: "e.g. My Extra ID"),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          ElevatedButton(
+            onPressed: () {
+              if (nameController.text.isNotEmpty) {
+                Navigator.pop(context);
+                _showUploadModal(nameController.text, isCustom: true);
+              }
+            },
+            child: const Text("Next"),
+          ),
         ],
       ),
     );
   }
 
-  void _showUploadModal(String docTitle) {
+  Widget _buildRequirementItem(String title, {required bool isCustom}) {
+    final Map<String, dynamic>? file = globalUploads[title];
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).cardColor,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: isDark ? Colors.white10 : Colors.grey[100]!),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.01), blurRadius: 10)],
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: file != null ? Colors.green.withValues(alpha: 0.1) : widget.color.withValues(alpha: 0.1),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(
+              file != null ? Icons.check : Icons.description_outlined, 
+              color: file != null ? Colors.green : widget.color, 
+              size: 20
+            ),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                    if (file != null)
+                      IconButton(
+                        icon: Icon(Icons.edit, size: 14, color: isDark ? Colors.white38 : Colors.grey),
+                        onPressed: () => _showRenameDialog(title, isCustom),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                      ),
+                  ],
+                ),
+                Text(file != null ? file['name'] : "Pending upload", style: TextStyle(fontSize: 12, color: file != null ? (isDark ? Colors.white70 : Colors.black54) : Colors.redAccent.withValues(alpha: 0.6))),
+              ],
+            ),
+          ),
+          if (file == null)
+            ElevatedButton(
+              onPressed: () => _showUploadModal(title, isCustom: isCustom),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: widget.color,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                minimumSize: const Size(60, 32),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              child: const Text("Upload", style: TextStyle(fontSize: 12)),
+            )
+          else
+            Row(
+              children: [
+                IconButton(
+                  onPressed: () => _showFilePreview(file),
+                  icon: const Icon(Icons.visibility_outlined, color: Colors.blue, size: 20),
+                  tooltip: "View File",
+                ),
+                IconButton(
+                  onPressed: () => setState(() {
+                    globalUploads.remove(title);
+                    _saveUploadsToDisk();
+                  }), 
+                  icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 20),
+                  tooltip: "Remove",
+                ),
+              ],
+            )
+        ],
+      ),
+    );
+  }
+
+  void _showRenameDialog(String oldTitle, bool isCustom) {
+    final TextEditingController nameController = TextEditingController(text: oldTitle);
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Rename File Label"),
+        content: TextField(
+          controller: nameController,
+          decoration: const InputDecoration(labelText: "New Name"),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          ElevatedButton(
+            onPressed: () {
+              if (nameController.text.isNotEmpty) {
+                setState(() {
+                  final data = globalUploads.remove(oldTitle);
+                  if (data != null) {
+                    globalUploads[nameController.text] = data;
+                    _saveUploadsToDisk();
+                  }
+                });
+                Navigator.pop(context);
+              }
+            },
+            child: const Text("Rename"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showFilePreview(Map<String, dynamic> file) {
+    String fileName = file['name'];
+    String? filePath = file['path'];
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        title: Text(fileName, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        content: Container(
+          width: double.maxFinite,
+          height: 300,
+          decoration: BoxDecoration(
+            color: Colors.grey[100],
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: filePath != null && (fileName.toLowerCase().endsWith(".jpg") || fileName.toLowerCase().endsWith(".png") || fileName.toLowerCase().endsWith(".jpeg"))
+              ? ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: Image.file(
+                    File(filePath),
+                    fit: BoxFit.contain,
+                  ),
+                )
+              : Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      fileName.toLowerCase().endsWith(".pdf") ? Icons.picture_as_pdf : Icons.image,
+                      size: 80,
+                      color: widget.color.withValues(alpha: 0.5),
+                    ),
+                    const SizedBox(height: 20),
+                    const Text("Document Preview", style: TextStyle(fontWeight: FontWeight.bold)),
+                    const Text("Securely encrypted and stored", style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  ],
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Close"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showUploadModal(String docTitle, {required bool isCustom}) {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -1942,7 +2665,12 @@ class _RequirementsViewState extends State<RequirementsView> {
       builder: (context) => UploadModal(
         docTitle: docTitle,
         onComplete: (fileData) {
-          setState(() => _uploadedFiles[docTitle] = fileData);
+          setState(() {
+            fileData['timestamp'] = DateTime.now();
+            fileData['folder'] = widget.folderName;
+            globalUploads[docTitle] = fileData;
+            _saveUploadsToDisk();
+          });
         },
       ),
     );
@@ -1963,7 +2691,22 @@ class _UploadModalState extends State<UploadModal> {
   double progress = 0.0;
   String statusText = "Uploading...";
 
-  void _startUpload() async {
+  void _startUpload(bool fromCamera) async {
+    final picker = ImagePicker();
+    XFile? pickedFile;
+    
+    if (fromCamera) {
+      pickedFile = await picker.pickImage(source: ImageSource.camera);
+    } else {
+      // Pick generic file
+      FilePickerResult? result = await FilePicker.platform.pickFiles();
+      if (result != null) {
+        pickedFile = XFile(result.files.single.path!);
+      }
+    }
+
+    if (pickedFile == null) return;
+
     setState(() { isUploading = true; });
     for (int i = 0; i <= 100; i += 5) {
       if (!mounted) return;
@@ -1974,8 +2717,9 @@ class _UploadModalState extends State<UploadModal> {
       await Future.delayed(const Duration(milliseconds: 150));
     }
     widget.onComplete({
-      'name': "${widget.docTitle.replaceAll(' ', '_').toLowerCase()}.pdf",
-      'size': "2.4 MB"
+      'name': pickedFile.name,
+      'path': pickedFile.path,
+      'size': "Size calculated"
     });
     if (mounted) Navigator.pop(context);
   }
@@ -2071,22 +2815,22 @@ class _UploadModalState extends State<UploadModal> {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            _sourceItem(Icons.photo_library_outlined, "Gallery"),
-            _sourceItem(Icons.camera_alt_outlined, "Camera"),
-            _sourceItem(Icons.cloud_outlined, "Cloud Drive"),
+            _sourceItem(Icons.photo_library_outlined, "Gallery", false),
+            _sourceItem(Icons.camera_alt_outlined, "Camera", true),
+            _sourceItem(Icons.cloud_outlined, "Files", false),
           ],
         ),
       ),
     );
   }
 
-  Widget _sourceItem(IconData icon, String label) {
+  Widget _sourceItem(IconData icon, String label, bool isCamera) {
     return ListTile(
       leading: Icon(icon, color: const Color(0xFF4F378A)),
       title: Text(label),
       onTap: () {
         Navigator.pop(context); // Close menu
-        _startUpload(); // Start progress
+        _startUpload(isCamera); // Start progress
       },
     );
   }
@@ -2262,7 +3006,7 @@ class _WithdrawViewState extends State<WithdrawView> {
                 children: ["500", "1,000", "5,000"].map((val) => ActionChip(
                   label: Text("₱$val"),
                   onPressed: () => _amountController.text = val.replaceAll(",", ""),
-                  backgroundColor: Colors.grey[100],
+                  backgroundColor: Theme.of(context).brightness == Brightness.dark ? Colors.white12 : Colors.grey[100],
                 )).toList(),
               ),
               const SizedBox(height: 40),
@@ -2296,15 +3040,16 @@ class _WithdrawViewState extends State<WithdrawView> {
   }
 
   Widget _methodTile(String name, IconData icon, Color color) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return GestureDetector(
       onTap: () => setState(() { _step = 2; }),
       child: Container(
         margin: const EdgeInsets.only(bottom: 16),
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
-          color: Colors.white,
+          color: Theme.of(context).cardColor,
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: Colors.grey[200]!),
+          border: Border.all(color: isDark ? Colors.white10 : Colors.grey[200]!),
         ),
         child: Row(
           children: [
@@ -2392,12 +3137,14 @@ class DigitalIDView extends StatelessWidget {
         String name = "JUAN DELA CRUZ";
         String scholarId = "2026-10045";
         String course = "Grade 12 - STEM";
+        String? photoPath;
 
         if (snapshot.hasData && snapshot.data!.exists) {
           var data = snapshot.data!.data() as Map<String, dynamic>;
           name = (data['full_name'] ?? name).toUpperCase();
           scholarId = data['scholar_number'] ?? scholarId;
           course = "${data['year_level'] ?? 'N/A'} - ${data['course'] ?? 'N/A'}";
+          photoPath = data['profile_photo_path'];
         }
 
         return Scaffold(
@@ -2408,7 +3155,7 @@ class DigitalIDView extends StatelessWidget {
               height: 500,
               padding: const EdgeInsets.all(24),
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: Theme.of(context).brightness == Brightness.dark ? const Color(0xFF1E1E1E) : Colors.white,
                 borderRadius: BorderRadius.circular(30),
                 boxShadow: [BoxShadow(color: accentColor.withValues(alpha: 0.2), blurRadius: 30, spreadRadius: 5)],
                 border: Border.all(color: accentColor.withValues(alpha: 0.3), width: 2),
@@ -2418,26 +3165,31 @@ class DigitalIDView extends StatelessWidget {
                   const Text("SCHOLARSHIP PORTAL", style: TextStyle(fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 2, color: accentColor)),
                   const SizedBox(height: 20),
                   Container(
-                    width: 120,
-                    height: 120,
+                    width: 140,
+                    height: 140,
                     decoration: BoxDecoration(
-                      color: Colors.grey[200],
+                      color: Theme.of(context).brightness == Brightness.dark ? Colors.white10 : Colors.grey[200],
                       shape: BoxShape.circle,
                       border: Border.all(color: accentColor, width: 3),
+
+                      image: photoPath != null ? DecorationImage(image: FileImage(File(photoPath)), fit: BoxFit.cover) : null,
                     ),
-                    child: const Icon(Icons.person, size: 80, color: Colors.grey),
+                    child: photoPath == null ? const Icon(Icons.person, size: 80, color: Colors.grey) : null,
                   ),
                   const SizedBox(height: 20),
-                  Text(name, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Color(0xFF342361))),
-                  Text(course, style: const TextStyle(color: Colors.black54)),
+                  Text(name, style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Theme.of(context).brightness == Brightness.dark ? Colors.white70 : const Color(0xFF342361))),
+                  Text(course, style: TextStyle(color: Theme.of(context).brightness == Brightness.dark ? Colors.white38 : Colors.black54)),
                   const SizedBox(height: 10),
                   Text("ID: $scholarId", style: const TextStyle(fontWeight: FontWeight.bold, color: accentColor)),
                   const Spacer(),
                   // Placeholder for QR
                   Container(
                     padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(border: Border.all(color: Colors.black12), borderRadius: BorderRadius.circular(16)),
-                    child: const Icon(Icons.qr_code_2, size: 100),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Theme.of(context).brightness == Brightness.dark ? Colors.white10 : Colors.black12), 
+                      borderRadius: BorderRadius.circular(16)
+                    ),
+                    child: Icon(Icons.qr_code_2, size: 100, color: Theme.of(context).brightness == Brightness.dark ? Colors.white70 : Colors.black),
                   ),
                   const Spacer(),
                 ],
@@ -2461,6 +3213,278 @@ class SettingsView extends StatefulWidget {
 }
 
 class _SettingsViewState extends State<SettingsView> {
+  bool _pushNotifications = true;
+  late bool _biometricLogin;
+
+  @override
+  void initState() {
+    super.initState();
+    _biometricLogin = isBiometricEnabled;
+  }
+
+  void _showFeatureUnavailable(String feature) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("$feature is currently being optimized. Stay tuned!")),
+    );
+  }
+
+  void _showThemeDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Theme Preference"),
+        content: ValueListenableBuilder<ThemeMode>(
+          valueListenable: themeNotifier,
+          builder: (context, currentMode, _) {
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _themeOption("Light Mode", ThemeMode.light, currentMode),
+                _themeOption("Dark Mode", ThemeMode.dark, currentMode),
+                _themeOption("System Default", ThemeMode.system, currentMode),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _themeOption(String label, ThemeMode mode, ThemeMode groupValue) {
+    return RadioListTile<ThemeMode>(
+      title: Text(label),
+      value: mode,
+      groupValue: groupValue,
+      onChanged: (value) async {
+        if (value != null) {
+          themeNotifier.value = value;
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('theme_mode', value.toString());
+          if (mounted) Navigator.pop(context);
+        }
+      },
+    );
+  }
+
+  void _toggleBiometric(bool value) async {
+    if (value) {
+      // Check if device supports biometrics before trying to enable
+      final bool canAuthenticateWithBiometrics = await auth.canCheckBiometrics;
+      final bool canAuthenticate = canAuthenticateWithBiometrics || await auth.isDeviceSupported();
+
+      if (!canAuthenticate) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Biometric authentication is not supported on this device.")),
+          );
+        }
+        return;
+      }
+
+      bool authenticated = false;
+      try {
+        authenticated = await auth.authenticate(
+          localizedReason: 'Confirm your identity to enable biometric login',
+          options: const AuthenticationOptions(
+            stickyAuth: true,
+            biometricOnly: false,
+          ),
+        );
+      } catch (e) {
+        debugPrint("Biometric enrollment error: $e");
+      }
+
+      if (authenticated) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('biometric_enabled', true);
+        setState(() {
+          isBiometricEnabled = true;
+          _biometricLogin = true;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Biometric login enabled!")),
+          );
+        }
+      } else {
+        setState(() {
+          _biometricLogin = false;
+        });
+      }
+    } else {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('biometric_enabled', false);
+      setState(() {
+        isBiometricEnabled = false;
+        _biometricLogin = false;
+      });
+    }
+  }
+
+  Future<void> _changeProfilePicture() async {
+    final picker = ImagePicker();
+    
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.only(topLeft: Radius.circular(20), topRight: Radius.circular(20))),
+      builder: (context) => Container(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text("Update Profile Picture", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            const Text("Requirement: Please use a real photo of your face. Avatars or animated photos are not allowed.", 
+              style: TextStyle(color: Colors.redAccent, fontSize: 12), textAlign: TextAlign.center),
+            const SizedBox(height: 24),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _buildPickerOption(Icons.camera_alt, "Camera", () async {
+                  Navigator.pop(context);
+                  final XFile? image = await picker.pickImage(source: ImageSource.camera);
+                  if (image != null) _updateProfilePhoto(image.path);
+                }),
+                _buildPickerOption(Icons.photo_library, "Gallery", () async {
+                  Navigator.pop(context);
+                  final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+                  if (image != null) _updateProfilePhoto(image.path);
+                }),
+              ],
+            ),
+            const SizedBox(height: 16),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPickerOption(IconData icon, String label, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(color: const Color(0xFFF3EDFF), shape: BoxShape.circle),
+            child: Icon(icon, color: const Color(0xFF4F378A), size: 30),
+          ),
+          const SizedBox(height: 8),
+          Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _updateProfilePhoto(String path) async {
+    final user = FirebaseAuth.instance.currentUser;
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    
+    // 1. Show validation status
+    scaffoldMessenger.showSnackBar(
+      const SnackBar(content: Text("Validating profile photo..."), duration: Duration(seconds: 2)),
+    );
+
+    // 2. Perform Face Detection
+    final InputImage inputImage = InputImage.fromFilePath(path);
+    final faceDetector = FaceDetector(options: FaceDetectorOptions(
+      enableContours: false,
+      enableClassification: false,
+    ));
+
+    try {
+      final List<Face> faces = await faceDetector.processImage(inputImage);
+      await faceDetector.close();
+
+      if (faces.isEmpty) {
+        // NO FACE DETECTED
+        if (mounted) {
+          showDialog(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Row(
+                children: [
+                  Icon(Icons.error_outline, color: Colors.red),
+                  SizedBox(width: 10),
+                  Text("Invalid Photo"),
+                ],
+              ),
+              content: const Text("Face not detected. Please upload a clear photo of your face. Avatars, objects, or scenery are not allowed for scholarship security."),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text("Try Again"),
+                ),
+              ],
+            ),
+          );
+        }
+        return;
+      }
+
+      // FACE DETECTED -> Proceed with update
+      // In a real app, you would upload to Firebase Storage first.
+      // For this simulation, we'll save the local path to Firestore.
+      await FirebaseFirestore.instance.collection('users').doc(user?.uid).update({
+        'profile_photo_path': path,
+      });
+      
+      if (mounted) {
+        scaffoldMessenger.showSnackBar(
+          const SnackBar(content: Text("Profile photo verified and updated successfully!")),
+        );
+      }
+    } catch (e) {
+      debugPrint("Face detection error: $e");
+      if (mounted) {
+        scaffoldMessenger.showSnackBar(
+          const SnackBar(content: Text("Error validating photo. Please try again.")),
+        );
+      }
+    }
+  }
+
+  Future<void> _editProfile(Map<String, dynamic> data) async {
+    final nameController = TextEditingController(text: data['full_name']);
+    final courseController = TextEditingController(text: data['course'] ?? "");
+    final scholarNumController = TextEditingController(text: data['scholar_number'] ?? "");
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Edit Personal Information"),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: nameController, decoration: const InputDecoration(labelText: "Full Name")),
+              const SizedBox(height: 16),
+              TextField(controller: courseController, decoration: const InputDecoration(labelText: "Course")),
+              const SizedBox(height: 16),
+              TextField(controller: scholarNumController, decoration: const InputDecoration(labelText: "Scholar Number")),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          ElevatedButton(
+            onPressed: () async {
+              final user = FirebaseAuth.instance.currentUser;
+              final navigator = Navigator.of(context);
+              await FirebaseFirestore.instance.collection('users').doc(user?.uid).update({
+                'full_name': nameController.text.trim(),
+                'course': courseController.text.trim(),
+                'scholar_number': scholarNumController.text.trim(),
+              });
+              if (mounted) navigator.pop();
+            },
+            child: const Text("Save Changes"),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final user = FirebaseAuth.instance.currentUser;
@@ -2470,9 +3494,13 @@ class _SettingsViewState extends State<SettingsView> {
       builder: (context, snapshot) {
         String name = "Juan Dela Cruz";
         String email = user?.email ?? "student@scholar.app";
+        String? photoPath;
+        Map<String, dynamic> data = {};
 
         if (snapshot.hasData && snapshot.data!.exists) {
-          name = snapshot.data!.get('full_name') ?? name;
+          data = snapshot.data!.data() as Map<String, dynamic>;
+          name = data['full_name'] ?? name;
+          photoPath = data['profile_photo_path'];
         }
 
         return Scaffold(
@@ -2483,7 +3511,25 @@ class _SettingsViewState extends State<SettingsView> {
               Center(
                 child: Column(
                   children: [
-                    const CircleAvatar(radius: 50, backgroundColor: Color(0xFF4F378A), child: Icon(Icons.person, size: 60, color: Colors.white)),
+                    GestureDetector(
+                      onTap: _changeProfilePicture,
+                      child: Stack(
+                        alignment: Alignment.bottomRight,
+                        children: [
+                          CircleAvatar(
+                            radius: 50,
+                            backgroundColor: const Color(0xFF4F378A),
+                            backgroundImage: photoPath != null ? FileImage(File(photoPath)) : null,
+                            child: photoPath == null ? const Icon(Icons.person, size: 60, color: Colors.white) : null,
+                          ),
+                          Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: const BoxDecoration(color: Color(0xFF342361), shape: BoxShape.circle),
+                            child: const Icon(Icons.camera_alt, size: 18, color: Colors.white),
+                          ),
+                        ],
+                      ),
+                    ),
                     const SizedBox(height: 12),
                     Text(name, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                     Text(email, style: const TextStyle(color: Colors.grey)),
@@ -2491,21 +3537,21 @@ class _SettingsViewState extends State<SettingsView> {
                 ),
               ),
               const SizedBox(height: 30),
-              _buildSettingItem("Edit Profile", Icons.person_outline),
-              _buildToggleItem("Notification Push", true),
+              _buildSettingItem("Edit Profile", Icons.person_outline, onTap: () => _editProfile(data)),
+              _buildToggleItem("Notification Push", _pushNotifications, (v) => setState(() => _pushNotifications = v)),
               _buildToggleItem("Scholar Alert Sound", isScholarAlertEnabled, (v) {
                 setState(() {
                   isScholarAlertEnabled = v;
                 });
               }),
-              _buildSettingItem("Theme Preferences", Icons.palette_outlined),
+              _buildSettingItem("Theme Preferences", Icons.palette_outlined, onTap: _showThemeDialog),
               const Divider(indent: 20, endIndent: 20),
               const Padding(
                 padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
                 child: Text("SECURITY", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 12)),
               ),
-              _buildToggleItem("Biometric Log-in", true),
-              _buildSettingItem("Change Password", Icons.lock_outline),
+              _buildToggleItem("Biometric Log-in", _biometricLogin, _toggleBiometric),
+              _buildSettingItem("Change Password", Icons.lock_outline, onTap: () => _showFeatureUnavailable("Password recovery")),
               const SizedBox(height: 20),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -2539,12 +3585,12 @@ class _SettingsViewState extends State<SettingsView> {
     );
   }
 
-  Widget _buildSettingItem(String title, IconData icon) {
+  Widget _buildSettingItem(String title, IconData icon, {VoidCallback? onTap}) {
     return ListTile(
       leading: Icon(icon, color: const Color(0xFF4F378A)),
       title: Text(title),
       trailing: const Icon(Icons.chevron_right, size: 20),
-      onTap: () {},
+      onTap: onTap,
     );
   }
 
@@ -2563,43 +3609,104 @@ class _SettingsViewState extends State<SettingsView> {
   }
 }
 
-class DocumentChecklistDrawer extends StatelessWidget {
+class DocumentChecklistDrawer extends StatefulWidget {
   const DocumentChecklistDrawer({super.key});
+
+  @override
+  State<DocumentChecklistDrawer> createState() => _DocumentChecklistDrawerState();
+}
+
+class _DocumentChecklistDrawerState extends State<DocumentChecklistDrawer> {
+  // Simple local state for the session. For persistence, use SharedPreferences.
+  final Map<String, bool> _checkedItems = {
+    "ITR of Parents / Affidavit": false,
+    "Certificate of Indigency": false,
+    "Certified True Copy of Grades": false,
+    "GWA Certification": false,
+    "Good Moral Certificate": false,
+    "PSA Birth Certificate": false,
+    "Voter's Certification": false,
+  };
 
   @override
   Widget build(BuildContext context) {
     return Drawer(
+      backgroundColor: Colors.white,
       child: Column(
         children: [
-          const DrawerHeader(
-            decoration: BoxDecoration(color: Color(0xFF4F378A)),
-            child: Center(
+          DrawerHeader(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xFF4F378A), Color(0xFF342361)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+            ),
+            child: const Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(Icons.folder_shared, color: Colors.white, size: 48),
+                  Icon(Icons.fact_check, color: Colors.white, size: 40),
                   SizedBox(height: 12),
-                  Text("Document Checklist", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  Text(
+                    "Requirement Guide",
+                    style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    "Track your documents",
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
                 ],
               ),
             ),
           ),
-          const Padding(
-            padding: EdgeInsets.all(16.0),
-            child: Text("Common files needed for most scholarship applications:", style: TextStyle(color: Colors.black54, fontSize: 13)),
+          Expanded(
+            child: ListView(
+              padding: EdgeInsets.zero,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(20, 20, 20, 10),
+                  child: Text(
+                    "PREPARATION CHECKLIST",
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey, letterSpacing: 1),
+                  ),
+                ),
+                ..._checkedItems.keys.map((title) => _buildCheckItem(title)),
+                Padding(
+                  padding: const EdgeInsets.all(20.0),
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF3EDFF),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.info_outline, size: 16, color: Color(0xFF4F378A)),
+                        SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            "Tick these off as you prepare your physical copies.",
+                            style: TextStyle(fontSize: 11, color: Color(0xFF4F378A)),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
-          _buildCheckItem("ITR of Parents / Affidavit"),
-          _buildCheckItem("Certificate of Indigency"),
-          _buildCheckItem("Certified True Copy of Grades"),
-          _buildCheckItem("GWA Certification"),
-          _buildCheckItem("Good Moral Certificate"),
-          const Spacer(),
           Padding(
             padding: const EdgeInsets.all(20),
             child: ElevatedButton(
               onPressed: () => Navigator.pop(context),
-              style: ElevatedButton.styleFrom(minimumSize: const Size(double.infinity, 50), backgroundColor: const Color(0xFF4F378A)),
-              child: const Text("Got it!", style: TextStyle(color: Colors.white)),
+              style: ElevatedButton.styleFrom(
+                minimumSize: const Size(double.infinity, 50),
+                backgroundColor: const Color(0xFF4F378A),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              child: const Text("Got it!", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
             ),
           )
         ],
@@ -2609,11 +3716,24 @@ class DocumentChecklistDrawer extends StatelessWidget {
 
   Widget _buildCheckItem(String title) {
     return CheckboxListTile(
-      value: false,
-      onChanged: (v) {},
-      title: Text(title, style: const TextStyle(fontSize: 14)),
+      value: _checkedItems[title],
+      onChanged: (v) {
+        setState(() {
+          _checkedItems[title] = v ?? false;
+        });
+      },
+      title: Text(
+        title,
+        style: TextStyle(
+          fontSize: 14,
+          fontWeight: _checkedItems[title]! ? FontWeight.bold : FontWeight.normal,
+          color: _checkedItems[title]! ? const Color(0xFF4F378A) : Colors.black87,
+          decoration: _checkedItems[title]! ? TextDecoration.lineThrough : null,
+        ),
+      ),
       controlAffinity: ListTileControlAffinity.leading,
       activeColor: const Color(0xFF4F378A),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12),
     );
   }
 }
@@ -2694,9 +3814,9 @@ class AnnouncementDetailView extends StatelessWidget {
 
                   const SizedBox(height: 24),
 
-                  _buildInfoRow(Icons.calendar_today_outlined, date),
-                  _buildInfoRow(Icons.access_time, "Office Hours (8:00 AM - 5:00 PM)"),
-                  _buildInfoRow(Icons.location_on_outlined, "Scholarship Office / Online"),
+                  _buildAnnouncementInfoRow(Icons.calendar_today_outlined, date),
+                  _buildAnnouncementInfoRow(Icons.access_time, "Office Hours (8:00 AM - 5:00 PM)"),
+                  _buildAnnouncementInfoRow(Icons.location_on_outlined, "Scholarship Office / Online"),
 
                   const SizedBox(height: 32),
 
@@ -2715,7 +3835,7 @@ class AnnouncementDetailView extends StatelessWidget {
     );
   }
 
-  Widget _buildInfoRow(IconData icon, String text) {
+  Widget _buildAnnouncementInfoRow(IconData icon, String text) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
       child: Row(
@@ -2776,14 +3896,15 @@ class _NotificationsListViewState extends State<NotificationsListView> {
               separatorBuilder: (context, index) => const SizedBox(height: 12),
               itemBuilder: (context, index) {
                 final notification = globalNotifications[index];
+                final bool isDark = Theme.of(context).brightness == Brightness.dark;
                 return Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: Theme.of(context).cardColor,
                     borderRadius: BorderRadius.circular(16),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.05),
+                        color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.05),
                         blurRadius: 10,
                         offset: const Offset(0, 4),
                       )
@@ -2871,6 +3992,7 @@ class TransactionHistoryView extends StatelessWidget {
             itemCount: docs.length,
             itemBuilder: (context, index) {
               final data = docs[index].data() as Map<String, dynamic>;
+              final bool isDark = Theme.of(context).brightness == Brightness.dark;
               final amount = (data['amount'] ?? 0.0).toDouble();
               final status = data['status'] ?? 'Pending';
               final timestamp = data['timestamp'] as Timestamp?;
@@ -2882,9 +4004,9 @@ class TransactionHistoryView extends StatelessWidget {
                 margin: const EdgeInsets.only(bottom: 12),
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  color: Colors.white,
+                  color: Theme.of(context).cardColor,
                   borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: Colors.grey[100]!),
+                  border: Border.all(color: isDark ? Colors.white10 : Colors.grey[100]!),
                 ),
                 child: Row(
                   children: [
@@ -3047,19 +4169,40 @@ class AdminOverview extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 24),
-        GridView.count(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          crossAxisCount: 2,
-          crossAxisSpacing: 16,
-          mainAxisSpacing: 16,
-          childAspectRatio: 1.1, // Fixed: Increased height to prevent overflow
-          children: [
-            _buildStatCard("Total Scholars", "1,245", Icons.people, Colors.blue),
-            _buildStatCard("Pending Apps", "48", Icons.assignment, Colors.orange),
-            _buildStatCard("Pending Payouts", "12", Icons.payments, Colors.green),
-            _buildStatCard("Active Grants", "8", Icons.campaign, Colors.purple),
-          ],
+        
+        // Dynamic stats from Firestore
+        StreamBuilder<QuerySnapshot>(
+          stream: FirebaseFirestore.instance.collection('users').snapshots(),
+          builder: (context, userSnap) {
+            return StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance.collection('applications').snapshots(),
+              builder: (context, appSnap) {
+                return StreamBuilder<QuerySnapshot>(
+                  stream: FirebaseFirestore.instance.collection('withdrawals').snapshots(),
+                  builder: (context, withdrawSnap) {
+                    final totalScholars = userSnap.hasData ? userSnap.data!.docs.length : 0;
+                    final pendingApps = appSnap.hasData ? appSnap.data!.docs.where((d) => d['status'] == 'PENDING').length : 0;
+                    final pendingWithdraws = withdrawSnap.hasData ? withdrawSnap.data!.docs.where((d) => d['status'] == 'Pending').length : 0;
+                    
+                    return GridView.count(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      crossAxisCount: 2,
+                      crossAxisSpacing: 16,
+                      mainAxisSpacing: 16,
+                      childAspectRatio: 1.1,
+                      children: [
+                        _buildStatCard("Total Scholars", totalScholars.toString(), Icons.people, Colors.blue),
+                        _buildStatCard("Pending Apps", pendingApps.toString(), Icons.assignment, Colors.orange),
+                        _buildStatCard("Pending Payouts", pendingWithdraws.toString(), Icons.payments, Colors.green),
+                        _buildStatCard("Active Grants", "7", Icons.campaign, Colors.purple),
+                      ],
+                    );
+                  }
+                );
+              }
+            );
+          }
         ),
         const SizedBox(height: 32),
         // Added button to access Scholars List
@@ -3275,7 +4418,7 @@ class _AdminScholarDetailViewState extends State<AdminScholarDetailView> {
               await FirebaseFirestore.instance.collection('users').doc(widget.scholarDoc.id).update({
                 'wallet_balance': newBalance,
               });
-              if (mounted) {
+              if (context.mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Balance updated successfully")));
               }
             },
@@ -3715,7 +4858,16 @@ class SectionHeader extends StatelessWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF342361))),
+        Text(
+          title, 
+          style: TextStyle(
+            fontSize: 18, 
+            fontWeight: FontWeight.bold, 
+            color: Theme.of(context).brightness == Brightness.dark 
+                ? Colors.white.withValues(alpha: 0.9) 
+                : const Color(0xFF342361)
+          )
+        ),
         TextButton(
           onPressed: onSeeAll, 
           child: Text(onSeeAll == null ? "" : "See All", style: const TextStyle(color: Color(0xFF4F378A)))
@@ -3738,101 +4890,56 @@ class ScholarshipDetailView extends StatelessWidget {
     List<String> benefits = [];
     List<String> requirements = [];
 
-    if (title.contains("Bagong Pilipinas Merit")) {
+    if (title.contains("Iskolar ng Bayan")) {
+      description = "Automatic admission at free tuition para sa mga Public SHS graduates na nais mag-aral sa State Universities.";
       benefits = [
-        "Annual Financial Assistance up to ₱120,000 (Private HEIs)",
-        "Annual Financial Assistance up to ₱80,000 (SUCs)",
-        "Full Tuition and Miscellaneous Fees",
+        "Automatic Admission sa SUCs",
+        "Free Tuition Fee",
+        "Miscellaneous Fees Support",
       ];
       requirements = [
-        "Must have a GWA of at least 95%",
-        "Must be a Filipino Citizen",
-        "Incoming 1st Year College Student",
+        "Must be a Public SHS Graduate",
+        "Not currently enrolled in UP",
+        "Filipino Citizen",
       ];
-    } else if (title.contains("CHED Merit")) {
+    } else if (title.contains("Iskolar ni Gob")) {
+      description = "Financial assistance para sa mga college students na taga-Rizal sa loob ng 3 taon o higit pa.";
       benefits = [
-        "Full Merit: ₱120,000/year (Private) / ₱80,000 (State)",
-        "Half Merit: ₱60,000/year (Private) / ₱40,000 (State)",
-        "Book Allowance and Stipend",
+        "Financial Assistance: ₱5,000 per Semester",
+        "SAP (Special Assistance Program)",
       ];
       requirements = [
-        "Must have a GWA of at least 93%",
-        "Family income must not exceed ₱500k",
-        "Incoming 1st Year College Student",
+        "Taga-Rizal (3+ years residency)",
+        "College Student",
+        "Family income below ₱350,000/year",
       ];
-    } else if (title.contains("COSCHO")) {
+    } else if (title.contains("Iskolar ni Juan")) {
+      description = "Program para sa mga nais kumuha ng Tech-Voc courses sa ilalim ng DSWD at PHINMA Education.";
       benefits = [
-        "Regular Allowance: ₱80,000 per AY",
-        "Other Allowances (Thesis/OJT/Laptop): ₱115,000 per AY",
+        "Free Tuition Fee",
+        "Monthly Allowance sa partner schools",
       ];
       requirements = [
-        "Must have a GWA of at least 80%",
-        "Family income must not exceed ₱300k",
-        "Incoming & Current College Students",
+        "Interest in Tech-Voc courses",
+        "Belongs to a low-income family",
       ];
-    } else if (title.contains("ACEF-GIAHEP")) {
-      benefits = [
-        "Private HEIs: ₱60,000 per year",
-        "SUCs/LUCs: ₱40,000 per year",
-      ];
-      requirements = [
-        "Must enroll in CHED priority programs (Agriculture, Forestry, Fisheries, etc.)",
-        "Family income must not exceed ₱400k",
-      ];
-    } else if (title.contains("UNIFEST-TES") || title.contains("TES")) {
-      benefits = [
-        "Private HEIs: ₱27,000 per year",
-        "SUCs/LUCs: ₱20,000 per year",
-        "₱10,000/AY for PWDs",
-        "₱8,000 one-time grant for Board/Licensure Exam takers",
-      ];
-      requirements = [
-        "Applicants must be Filipino Citizen",
-        "Enrolled in CHED-recognized institution",
-        "Ongoing College Students / Undergrads",
-      ];
-    } else if (title.contains("DOST")) {
-      benefits = [
-        "Full Tuition Subsidy (up to ₱40,000/year)",
-        "Monthly Living Allowance (₱7,000)",
-        "Book Allowance (₱10,000/year)",
-      ];
-      requirements = [
-        "Must be a STEM student",
-        "Must be in the top 5% of graduating class",
-        "Must pass the DOST-SEI Examination",
-      ];
-    } else if (title.contains("GT REAP")) {
-      benefits = [
-        "Brand New High-End Laptop",
-        "Monthly Internet & Living Allowance",
-        "Direct Hire for IT Internships",
-      ];
-      requirements = [
-        "3rd or 4th Year IT/CS Students",
-        "Must have a GWA of 2.0 or better",
-        "Actively enrolled in priority HEIs",
-      ];
-    } else if (title.contains("Gawad Talino")) {
-      benefits = [
-        "Medical School Tuition Support",
-        "Hospital Internship Slots",
-        "Post-Graduation Hospital Placement",
-      ];
-      requirements = [
-        "Health & Pharmacy related courses",
-        "No failing grades in major subjects",
-      ];
-    } else if (title.contains("LGU Assistance")) {
-      benefits = [
-        "₱5,000 - ₱10,000 Semesterly Subsidy",
-        "Uniform & School Supply Allowance",
-      ];
-      requirements = [
-        "Must be a bonafide resident of the city",
-        "Active Voter or child of a registered voter",
-      ];
-    } else if (title.contains("Intern")) {
+    } else if (title.contains("Iskolar ng Dolores")) {
+      description = "Educational assistance para sa mga college students na residente ng Barangay Dolores, Taytay.";
+      benefits = ["Educational Assistance per Semester", "Financial Aid for school needs"];
+      requirements = ["Residente ng Brgy. Dolores, Taytay", "Valid College Enrollment"];
+    } else if (title.contains("Sta. Ana Skolar")) {
+      description = "Financial aid program para sa mga masisipag na estudyante ng Barangay Sta. Ana, Taytay.";
+      benefits = ["Financial Aid per Semester", "Support for Tuition/Books"];
+      requirements = ["Residente ng Brgy. Sta. Ana, Taytay", "Good Academic Standing"];
+    } else if (title.contains("Skolar ng Muzon")) {
+      description = "Programang pang-edukasyon para sa mga kabataang residente ng Barangay Muzon, Taytay.";
+      benefits = ["Financial Aid per Semester", "Educational Assistance"];
+      requirements = ["Residente ng Brgy. Muzon, Taytay", "Actively Enrolled College Student"];
+    } else if (title.contains("Skolar ng Taytay")) {
+      description = "Ang pangunahing scholarship program ng LGU Taytay para sa lahat ng kwalipikadong kolehiyala sa bayan.";
+      benefits = ["Financial Aid per Semester", "Mayor's Office Educational Support"];
+      requirements = ["Residente ng Taytay, Rizal", "Qualified College Student"];
+    } else if (title.contains("Bagong Pilipinas Merit")) {
       description = "Gain valuable work experience with our summer internship program at leading tech companies.";
       benefits = ["Monthly Allowance: ₱15,000", "Certificate of Internship", "Hands-on Training"];
       requirements = ["Currently enrolled in a relevant degree", "Good communication skills", "Available for at least 8 weeks"];
@@ -3950,7 +5057,59 @@ class ApplicationFormView extends StatefulWidget {
 
 class _ApplicationFormViewState extends State<ApplicationFormView> {
   final _formKey = GlobalKey<FormState>();
+  final _addressController = TextEditingController();
   bool _isSubmitting = false;
+
+  @override
+  void dispose() {
+    _addressController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _getCurrentLocation() async {
+    bool serviceEnabled;
+    LocationPermission permission;
+
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Location services are disabled.')));
+      }
+      return;
+    }
+
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Location permissions are denied')));
+        }
+        return;
+      }
+    }
+    
+    if (permission == LocationPermission.deniedForever) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Location permissions are permanently denied.')));
+      }
+      return;
+    } 
+
+    try {
+      Position position = await Geolocator.getCurrentPosition();
+      List<Placemark> placemarks = await placemarkFromCoordinates(position.latitude, position.longitude);
+      if (placemarks.isNotEmpty) {
+        Placemark place = placemarks[0];
+        String address = "${place.street}, ${place.subLocality}, ${place.locality}, ${place.administrativeArea}";
+        _addressController.text = address;
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error fetching location: $e')));
+      }
+    }
+  }
 
   bool get _isJob => widget.title.contains("Intern") || 
                 widget.title.contains("Crew") || 
@@ -3980,6 +5139,8 @@ class _ApplicationFormViewState extends State<ApplicationFormView> {
               const SizedBox(height: 32),
               
               if (isJob) ...[
+                _buildFormInput("Full Name", "Enter your complete name", Icons.person_outline),
+                const SizedBox(height: 24),
                 _buildFormInputWithUpload(
                   label: "Resume / CV", 
                   hint: "", 
@@ -3987,27 +5148,162 @@ class _ApplicationFormViewState extends State<ApplicationFormView> {
                   uploadTitle: "Updated Resume (PDF/JPG)",
                   uploadSubtitle: "Required for application",
                   showTextField: false,
+                  isUploaded: globalUploads.containsKey("Resume") || globalUploads.values.any((v) => v['name'].toLowerCase().contains('resume')),
                 ),
                 _buildFormInput("Primary Skills", "e.g. Graphic Design, Typing, etc.", Icons.stars),
                 const SizedBox(height: 24),
                 _buildFormInput("Contact Number", "e.g. 09123456789", Icons.phone),
+                const SizedBox(height: 24),
+                _buildFormInput("Home Address", "Enter your current residence", Icons.location_on_outlined, 
+                  controller: _addressController,
+                  suffixIcon: IconButton(
+                    icon: const Icon(Icons.my_location, color: Color(0xFF4F378A)),
+                    onPressed: _getCurrentLocation,
+                  ),
+                ),
               ] else ...[
-                _buildFormInputWithUpload(
-                  label: "GWA Score", 
-                  hint: "Enter your general average (e.g. 95.0)", 
-                  icon: Icons.grade,
-                  uploadTitle: "Report Card / Summary of Grades",
-                  uploadSubtitle: "Proof of GWA Score",
+                _buildFormInput("Full Name", "Name as shown on official records", Icons.person_outline),
+                const SizedBox(height: 24),
+                _buildFormInput("Date of Birth", "MM/DD/YYYY", Icons.cake_outlined),
+                const SizedBox(height: 24),
+                _buildFormInput("Contact Number", "e.g. 09123456789", Icons.phone),
+                const SizedBox(height: 24),
+                _buildFormInput("Home Address", "Enter your complete address", Icons.location_on_outlined,
+                  controller: _addressController,
+                  suffixIcon: IconButton(
+                    icon: const Icon(Icons.my_location, color: Color(0xFF4F378A)),
+                    onPressed: _getCurrentLocation,
+                  ),
                 ),
+                const SizedBox(height: 32),
+                const Divider(),
+                const SizedBox(height: 32),
+                const Text("Required Documents & Info", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF342361))),
+                const SizedBox(height: 24),
 
-                _buildFormInputWithUpload(
-                  label: "Annual Family Income", 
-                  hint: "Enter total annual income (e.g. 300000)", 
-                  icon: Icons.money,
-                  uploadTitle: "ITR / Certificate of Indigency",
-                  uploadSubtitle: "Proof of Family Income",
-                ),
+                if (widget.title.contains("Bayan")) ...[
+                  _buildFormInputWithUpload(
+                    label: "GWA Score", 
+                    hint: "Enter your SHS general average", 
+                    icon: Icons.grade,
+                    uploadTitle: "Grade 12 Report Card",
+                    uploadSubtitle: "Final SHS Grades",
+                    isUploaded: globalUploads.containsKey("Grade 12 Report Card (1st Sem)") || globalUploads.values.any((v) => v['name'].toLowerCase().contains('card')),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Annual Family Income", 
+                    hint: "Total yearly household income", 
+                    icon: Icons.money,
+                    uploadTitle: "ITR / Affidavit of Income",
+                    uploadSubtitle: "Proof of financial status",
+                    isUploaded: globalUploads.containsKey("Certificate of Indigency"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Diploma Status", 
+                    hint: "Public SHS School Name", 
+                    icon: Icons.school,
+                    uploadTitle: "SHS Diploma / Graduation Cert",
+                    uploadSubtitle: "Proof of eligibility",
+                    isUploaded: globalUploads.containsKey("Scholarship Certification"),
+                  ),
+                ] else if (widget.title.contains("Gob")) ...[
+                  _buildFormInputWithUpload(
+                    label: "Residency Years", 
+                    hint: "How many years in Rizal?", 
+                    icon: Icons.timer,
+                    uploadTitle: "Voter's ID / Parent's Voter Cert",
+                    uploadSubtitle: "Proof of 3+ years residency",
+                    isUploaded: globalUploads.containsKey("Government ID / Passport"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "GWA Score", 
+                    hint: "Previous semester average", 
+                    icon: Icons.grade,
+                    uploadTitle: "Transcript of Records",
+                    uploadSubtitle: "Official grade summary",
+                    isUploaded: globalUploads.containsKey("Transcript of Records"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Social Status", 
+                    hint: "Number of siblings in school", 
+                    icon: Icons.people,
+                    uploadTitle: "Certificate of Indigency",
+                    uploadSubtitle: "Issued by Barangay / DSWD",
+                    isUploaded: globalUploads.containsKey("Certificate of Indigency"),
+                  ),
+                ] else if (widget.title.contains("Juan")) ...[
+                  _buildFormInput("Tech-Voc Interest", "e.g. Shielded Metal Arc Welding", Icons.settings_suggest),
+                  const SizedBox(height: 24),
+                  _buildFormInputWithUpload(
+                    label: "Barangay Record", 
+                    hint: "Barangay Name", 
+                    icon: Icons.house,
+                    uploadTitle: "Barangay Clearance",
+                    uploadSubtitle: "Proof of good standing",
+                    isUploaded: globalUploads.containsKey("Barangay Clearance"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Age Verification", 
+                    hint: "Current Age", 
+                    icon: Icons.badge,
+                    uploadTitle: "PSA Birth Certificate",
+                    uploadSubtitle: "Official birth record",
+                    isUploaded: globalUploads.containsKey("PSA Birth Certificate"),
+                  ),
+                ] else if (widget.title.contains("Dolores") || widget.title.contains("Ana") || widget.title.contains("Muzon")) ...[
+                  _buildFormInputWithUpload(
+                    label: "Barangay Residency", 
+                    hint: "Street / Phase Name", 
+                    icon: Icons.location_city,
+                    uploadTitle: "Certificate of Residency",
+                    uploadSubtitle: "Barangay specific residency",
+                    isUploaded: globalUploads.containsKey("Certificate of Indigency"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Current GWA", 
+                    hint: "Last semester grades", 
+                    icon: Icons.auto_graph,
+                    uploadTitle: "Report Card",
+                    uploadSubtitle: "Most recent academic record",
+                    isUploaded: globalUploads.containsKey("Grade 11 Report Card") || globalUploads.containsKey("Grade 12 Report Card (1st Sem)"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Enrollment Proof", 
+                    hint: "Course & Year Level", 
+                    icon: Icons.history_edu,
+                    uploadTitle: "Registration Form",
+                    uploadSubtitle: "Current semester COM/SER",
+                    isUploaded: globalUploads.values.any((v) => v['name'].toLowerCase().contains('registration') || v['name'].toLowerCase().contains('enrollment')),
+                  ),
+                ] else ...[
+                  // Default for Skolar ng Taytay and others
+                  _buildFormInputWithUpload(
+                    label: "GWA Score", 
+                    hint: "Enter your general average", 
+                    icon: Icons.grade,
+                    uploadTitle: "Summary of Grades",
+                    uploadSubtitle: "Proof of academic standing",
+                    isUploaded: globalUploads.containsKey("Grade 11 Report Card") || globalUploads.containsKey("Grade 12 Report Card (1st Sem)") || globalUploads.containsKey("Transcript of Records"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Annual Family Income", 
+                    hint: "Enter total annual income", 
+                    icon: Icons.money,
+                    uploadTitle: "ITR / Indigency",
+                    uploadSubtitle: "Proof of Family Income",
+                    isUploaded: globalUploads.containsKey("Certificate of Indigency") || globalUploads.containsKey("PSA Birth Certificate"),
+                  ),
+                  _buildFormInputWithUpload(
+                    label: "Community Status", 
+                    hint: "Are you a Taytay resident?", 
+                    icon: Icons.verified_user,
+                    uploadTitle: "Voter's Certification",
+                    uploadSubtitle: "Required for LGU grants",
+                    isUploaded: globalUploads.containsKey("Government ID / Passport"),
+                  ),
+                ],
 
+                const SizedBox(height: 24),
                 _buildFormInput("Course Enrolled", "e.g. BS Information Technology", Icons.book),
               ],
               
@@ -4040,17 +5336,19 @@ class _ApplicationFormViewState extends State<ApplicationFormView> {
     required String uploadTitle,
     required String uploadSubtitle,
     bool showTextField = true,
+    bool isUploaded = false,
   }) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Container(
       margin: const EdgeInsets.only(bottom: 24),
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: Theme.of(context).cardColor,
         borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: Colors.grey[200]!),
+        border: Border.all(color: isDark ? Colors.white10 : Colors.grey[200]!),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.02),
+            color: Colors.black.withValues(alpha: isDark ? 0.2 : 0.02),
             blurRadius: 10,
             offset: const Offset(0, 4),
           ),
@@ -4061,7 +5359,7 @@ class _ApplicationFormViewState extends State<ApplicationFormView> {
         children: [
           Row(
             children: [
-              Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF1A1A1A))),
+              Text(label, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: isDark ? Colors.white : const Color(0xFF1A1A1A))),
               const Text(" *", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 18)),
             ],
           ),
@@ -4071,10 +5369,10 @@ class _ApplicationFormViewState extends State<ApplicationFormView> {
               style: const TextStyle(fontSize: 16),
               decoration: InputDecoration(
                 hintText: hint,
-                hintStyle: const TextStyle(color: Colors.black26, fontSize: 14),
+                hintStyle: TextStyle(color: isDark ? Colors.white24 : Colors.black26, fontSize: 14),
                 prefixIcon: Icon(icon, size: 22, color: const Color(0xFF4F378A)),
                 filled: true,
-                fillColor: const Color(0xFFF3EDFF).withValues(alpha: 0.3),
+                fillColor: isDark ? Colors.white.withValues(alpha: 0.05) : const Color(0xFFF3EDFF).withValues(alpha: 0.3),
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
                 contentPadding: const EdgeInsets.symmetric(vertical: 18),
               ),
@@ -4088,7 +5386,7 @@ class _ApplicationFormViewState extends State<ApplicationFormView> {
             children: [
               Container(
                 padding: const EdgeInsets.all(10),
-                decoration: const BoxDecoration(color: Color(0xFFF3EDFF), shape: BoxShape.circle),
+                decoration: BoxDecoration(color: isDark ? Colors.white10 : const Color(0xFFF3EDFF), shape: BoxShape.circle),
                 child: const Icon(Icons.file_upload_outlined, color: Color(0xFF4F378A), size: 20),
               ),
               const SizedBox(width: 16),
@@ -4097,40 +5395,51 @@ class _ApplicationFormViewState extends State<ApplicationFormView> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(uploadTitle, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                    Text(uploadSubtitle, style: const TextStyle(fontSize: 11, color: Colors.black38)),
+                    Text(isUploaded ? "Uploaded from Vault" : uploadSubtitle, style: TextStyle(fontSize: 11, color: isUploaded ? Colors.green : (isDark ? Colors.white38 : Colors.black38))),
                   ],
                 ),
               ),
-              const Icon(Icons.check_circle, color: Colors.green, size: 24),
+              Icon(isUploaded ? Icons.check_circle : Icons.error_outline, color: isUploaded ? Colors.green : Colors.orange, size: 24),
             ],
           ),
+          if (!isUploaded)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Text(
+                "Go to Document Vault to upload this requirement.",
+                style: TextStyle(fontSize: 10, color: isDark ? Colors.orange[300] : Colors.orange[800], fontStyle: FontStyle.italic),
+              ),
+            ),
         ],
       ),
     );
   }
 
-  Widget _buildFormInput(String label, String hint, IconData icon) {
+  Widget _buildFormInput(String label, String hint, IconData icon, {TextEditingController? controller, Widget? suffixIcon}) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           children: [
-            Text(label, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Color(0xFF1A1A1A))),
+            Text(label, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: isDark ? Colors.white : const Color(0xFF1A1A1A))),
             const Text(" *", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 16)),
           ],
         ),
         const SizedBox(height: 8),
         TextFormField(
+          controller: controller,
           style: const TextStyle(fontSize: 16),
           decoration: InputDecoration(
             hintText: hint,
-            hintStyle: const TextStyle(color: Colors.black26, fontSize: 14),
+            hintStyle: TextStyle(color: isDark ? Colors.white24 : Colors.black26, fontSize: 14),
             prefixIcon: Icon(icon, size: 22, color: const Color(0xFF4F378A)),
+            suffixIcon: suffixIcon,
             filled: true,
-            fillColor: Colors.white,
+            fillColor: isDark ? Colors.white.withValues(alpha: 0.05) : Colors.white,
             errorStyle: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide(color: Colors.grey[200]!)),
-            enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide(color: Colors.grey[200]!)),
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide(color: isDark ? Colors.white10 : Colors.grey[200]!)),
+            enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide(color: isDark ? Colors.white10 : Colors.grey[200]!)),
             focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: Color(0xFF4F378A), width: 1.5)),
             errorBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: Colors.redAccent, width: 1.5)),
           ),
